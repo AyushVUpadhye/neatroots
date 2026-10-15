@@ -142,4 +142,17 @@ describe("search and exploring tools", () => {
     await until(() => nav.length > 0);
     expect(nav[0]).toBe(`runs/${a.traceId}?view=timeline`);
   });
+
+  it("stops a SQL query at the row cap instead of running it to the end", async () => {
+    t = await makeRoots({ noEngine: true });
+    type Out = { rows: { n: number }[]; truncated: boolean };
+    const exact = (await tool("query_sql").run(t.roots, { sql: "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c LIMIT 200) SELECT n FROM c" })) as Out;
+    expect(exact.truncated).toBe(false);
+    expect(exact.rows).toHaveLength(200);
+    // Unbounded, and row 202 raises a SQLite error: this only comes back if the tool stops reading early.
+    const sql = "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c) SELECT CASE WHEN n <= 201 THEN n ELSE json(n || 'x') END AS n FROM c";
+    const capped = (await tool("query_sql").run(t.roots, { sql })) as Out;
+    expect(capped.truncated).toBe(true);
+    expect(capped.rows.map((r) => r.n)).toEqual(Array.from({ length: 200 }, (_, i) => i + 1));
+  });
 });
