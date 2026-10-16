@@ -56,6 +56,35 @@ export function parseChecks(text: string): { checks: Check[]; errors: { id?: str
   return { checks, errors };
 }
 
+/**
+ * Removes every check with this id from a checks file and leaves the rest as written: other
+ * documents keep their exact text, and the edited one keeps its comments and any entries that
+ * don't validate (yet).
+ */
+function removeFromYaml(text: string, id: string): string {
+  const isOurs = (n: unknown) => YAML.isMap(n) && n.get("id") === id;
+  let out = "";
+  let at = 0;
+  for (const [i, doc] of YAML.parseAllDocuments(text).entries()) {
+    if (doc.errors.length) continue;
+    const contents = doc.contents;
+    const wrapped = YAML.isMap(contents) ? contents.get("checks", true) : undefined;
+    const list = YAML.isSeq(contents) ? contents : YAML.isSeq(wrapped) ? wrapped : undefined;
+    let next: string | undefined;
+    if (isOurs(contents)) next = "";
+    else if (list?.items.some(isOurs)) {
+      list.items = list.items.filter((n) => !isOurs(n));
+      next = doc.toString();
+    }
+    if (next === undefined) continue;
+    // The first document also owns any comments above it.
+    const start = i === 0 ? 0 : doc.range[0];
+    out += text.slice(at, start) + next;
+    at = doc.range[2];
+  }
+  return out + text.slice(at);
+}
+
 export function checkToYaml(check: Check): string {
   return YAML.stringify(check, { lineWidth: 100 });
 }
@@ -162,11 +191,13 @@ export class CheckRegistry {
     const lc = this.checks.get(id);
     if (!lc || lc.source === "library") return false;
     if (lc.path && fs.existsSync(lc.path)) {
-      const { checks } = parseChecks(fs.readFileSync(lc.path, "utf8"));
-      if (checks.length <= 1) fs.unlinkSync(lc.path);
-      else {
-        fs.writeFileSync(lc.path, YAML.stringify(checks.filter((c) => c.id !== id)), "utf8");
-      }
+      const before = fs.readFileSync(lc.path, "utf8");
+      const text = removeFromYaml(before, id);
+      const left = parseChecks(text);
+      if (text === before) {
+        /* edited by hand since it was loaded; nothing of this check left to remove */
+      } else if (!left.checks.length && !left.errors.length) fs.unlinkSync(lc.path);
+      else fs.writeFileSync(lc.path, text, "utf8");
     }
     this.store.db.prepare("DELETE FROM checks WHERE id = ?").run(id);
     this.reload();
