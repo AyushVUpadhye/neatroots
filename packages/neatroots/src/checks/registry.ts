@@ -56,6 +56,39 @@ export function parseChecks(text: string): { checks: Check[]; errors: { id?: str
   return { checks, errors };
 }
 
+/**
+ * Rewrites every check with this id in a checks file and leaves all other text as written:
+ * comments, other checks (including ones that don't validate yet) and other documents.
+ * Returns undefined when the file has no check with this id.
+ */
+function replaceInYaml(text: string, check: Check): string | undefined {
+  const isOurs = (n: unknown): n is YAML.YAMLMap => YAML.isMap(n) && n.get("id") === check.id;
+  const spans: { start: number; end: number; node: YAML.YAMLMap }[] = [];
+  for (const doc of YAML.parseAllDocuments(text)) {
+    if (doc.errors.length) continue;
+    const contents = doc.contents;
+    const wrapped = YAML.isMap(contents) ? contents.get("checks", true) : undefined;
+    const list = YAML.isSeq(contents) ? contents : YAML.isSeq(wrapped) ? wrapped : undefined;
+    for (const node of isOurs(contents) ? [contents] : (list?.items ?? [])) {
+      if (isOurs(node) && node.range) spans.push({ start: node.range[0], end: node.range[1], node });
+    }
+  }
+  if (!spans.length) return undefined;
+  const eol = text.includes("\r\n") ? "\r\n" : "\n";
+  let out = text;
+  for (const { start, end, node } of spans.reverse()) {
+    let next: string;
+    if (node.flow) next = YAML.stringify(check, { collectionStyle: "flow", lineWidth: 0 }).trimEnd();
+    else {
+      // A block mapping's text runs to the end of its last line; continue at its column.
+      const pad = " ".repeat(start - (text.lastIndexOf("\n", start - 1) + 1));
+      next = checkToYaml(check).trimEnd().split("\n").join(`${eol}${pad}`) + eol;
+    }
+    out = out.slice(0, start) + next + out.slice(end);
+  }
+  return out;
+}
+
 export function checkToYaml(check: Check): string {
   return YAML.stringify(check, { lineWidth: 100 });
 }
@@ -139,6 +172,8 @@ export class CheckRegistry {
   /**
    * Saves a check. `target` is "user" (~/.neatroots/checks), a project checks directory, or
    * "db" for planner-written checks that live only in the database until a person keeps them.
+   * A check that already lives in a user or project file is updated in that file, unless
+   * `target` names a different directory.
    */
   save(check: Check, target: "user" | "db" | { dir: string }, source: CheckSource = "user"): LoadedCheck {
     const parsed = AnyCheck.parse(check) as Check;
@@ -147,9 +182,24 @@ export class CheckRegistry {
       this.store.upsertCheckRow({ id: parsed.id, kind: parsed.kind === "rule" ? "rule" : "question", source, path: null, body: checkToYaml(parsed) });
     } else {
       const dir = target === "user" ? this.userDir : target.dir;
-      fs.mkdirSync(dir, { recursive: true });
-      p = path.join(dir, `${parsed.id}.yaml`);
-      fs.writeFileSync(p, checkToYaml(parsed), "utf8");
+      // A new <id>.yaml next to the file the check is loaded from would be shadowed by it (project
+      // directories load after the user one, files in name order), so the edit would be ignored.
+      const current = this.checks.get(parsed.id);
+      const inPlace =
+        current?.path &&
+        (current.source === "user" || current.source === "project") &&
+        (target === "user" || path.resolve(path.dirname(current.path)) === path.resolve(dir)) &&
+        fs.existsSync(current.path)
+          ? replaceInYaml(fs.readFileSync(current.path, "utf8"), parsed)
+          : undefined;
+      if (inPlace !== undefined) {
+        p = current!.path!;
+        fs.writeFileSync(p, inPlace, "utf8");
+      } else {
+        fs.mkdirSync(dir, { recursive: true });
+        p = path.join(dir, `${parsed.id}.yaml`);
+        fs.writeFileSync(p, checkToYaml(parsed), "utf8");
+      }
       if (source === "planner" || source === "mcp") source = target === "user" ? "user" : "project";
       this.store.db.prepare("DELETE FROM checks WHERE id = ? AND source IN ('planner', 'mcp')").run(parsed.id);
     }
