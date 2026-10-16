@@ -14,7 +14,7 @@ import { mountAgentsApi } from "./api-agents.js";
 import { importSource, mountExploreApi } from "./api-explore.js";
 import { checkCoverage } from "./coverage.js";
 import { installInfo } from "../util/install.js";
-import { err, body } from "./util.js";
+import { err, body, clampInt } from "./util.js";
 import { askRuns } from "../engine/assist.js";
 import { loadTrace } from "../engine/trace.js";
 import type { RunRow } from "../types.js";
@@ -111,14 +111,6 @@ function allowedEndpoint(u: string): boolean {
   } catch {
     return false;
   }
-}
-
-/** Parse a query param as an integer and clamp it to [min, max]; non-numbers fall back to `dflt`. */
-function clampInt(raw: string | undefined, dflt: number, min: number, max: number): number {
-  if (raw === undefined || raw === "") return dflt;
-  const n = Number(raw);
-  if (!Number.isFinite(n)) return dflt;
-  return Math.min(Math.max(Math.trunc(n), min), max);
 }
 
 /** When an LLM task fails because no LLM is reachable, say so and how to fix it. */

@@ -141,7 +141,10 @@ export class SteeringHub {
     this.roots.bus.emit("note", delivered);
     if (pick.finding_id) {
       const f = this.roots.store.getFinding(pick.finding_id);
-      if (f && f.status === "raised") this.roots.store.updateFinding(f.id, { status: "active" });
+      if (f && f.status === "raised") {
+        const next = this.roots.store.updateFinding(f.id, { status: "active" });
+        if (next) this.roots.bus.emit("finding", next);
+      }
     }
     return delivered;
   }

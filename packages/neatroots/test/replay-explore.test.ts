@@ -5,7 +5,7 @@ import { toChat } from "../src/replay/replay.js";
 import { Replays } from "../src/replay/replay.js";
 import { buildChat } from "../src/semantics/chat-view.js";
 import { parseSearch } from "../src/server/api-explore.js";
-import { batch, hex, llmSpan, makeRoots, mockLlm, span, toolSpan, until, type TestRoots } from "./helpers.js";
+import { batch, hex, llmSpan, makeRoots, mockLlm, s, span, toolSpan, until, type TestRoots } from "./helpers.js";
 
 let t: TestRoots | undefined;
 let llm: Awaited<ReturnType<typeof mockLlm>> | undefined;
@@ -141,6 +141,26 @@ describe("search and exploring tools", () => {
     await tool("show_in_ui").run(t.roots, { trace_id: a.traceId, view: "timeline" });
     await until(() => nav.length > 0);
     expect(nav[0]).toBe(`runs/${a.traceId}?view=timeline`);
+  });
+
+  it("list_projects counts failed runs, including ones interrupted by a restart", async () => {
+    t = await makeRoots({ noEngine: true });
+    const ok = hex(16);
+    const bad = hex(16);
+    const cut = hex(16);
+    t.roots.ingest([
+      batch([span({ traceId: ok, name: "checkout", kind: "workflow" })], "shop-agent"),
+      batch([span({ traceId: bad, name: "checkout", kind: "workflow", status: 2, message: "gateway timeout" })], "shop-agent"),
+      batch([span({ traceId: cut, name: "checkout", kind: "workflow", attrs: [s("neatlogs.trace.interrupted", true)] })], "shop-agent"),
+      batch([span({ traceId: hex(16), name: "browse", kind: "workflow" })], "calm-agent"),
+    ]);
+    const projects = (await tool("list_projects").run(t.roots, {})) as { project: string; runs: number; failed: number }[];
+    const shop = projects.find((p) => p.project === "shop-agent")!;
+    expect(shop.runs).toBe(3);
+    // Runs store ok/error/interrupted; a failed count of 0 for a project with an error and an
+    // interrupted run is the bug.
+    expect(shop.failed).toBe(2);
+    expect(projects.find((p) => p.project === "calm-agent")!.failed).toBe(0);
   });
 
   it("stops a SQL query at the row cap instead of running it to the end", async () => {

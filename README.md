@@ -283,10 +283,10 @@ can read) and never in the database.
 
 ```bash
 pnpm install && pnpm build    # UI, then the server (copies the UI into packages/neatroots/dist/ui)
-pnpm test                     # server tests (vitest)
+pnpm test                     # server and TypeScript steering tests (vitest)
 pnpm --filter @neatlogs/neatroots-ui e2e     # UI end-to-end tests (Playwright; real server, mock LLM)
-cd packages/steer-ts && pnpm test
-cd python/neatroots-steer && python -m pytest
+(cd python/neatroots-steer && python -m pytest)
+pnpm typecheck                # all pnpm workspaces
 sh examples/run-all.sh        # every example, against a running neatroots
 pnpm --filter @neatlogs/neatroots dev        # server with reload on 4100
 pnpm --filter @neatlogs/neatroots-ui dev     # UI on 5173 (set NEATROOTS_DEV_ORIGIN=http://localhost:5173 on the server)

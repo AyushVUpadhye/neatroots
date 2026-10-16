@@ -1,4 +1,5 @@
 import http from "node:http";
+import os from "node:os";
 import zlib from "node:zlib";
 import { afterEach, describe, expect, it } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -234,6 +235,36 @@ describe("server", () => {
     expect(await count("-5")).toBe(1); // was every finding (SQLite LIMIT -1)
     expect(await count("0")).toBe(1); // was none
     expect(await count("2")).toBe(2);
+  });
+
+  it("clamps the search limit instead of answering with no runs for a bad value", async () => {
+    const tb = await served();
+    const ids = [hex(16), hex(16), hex(16)];
+    ids.forEach((t) => tb.roots.ingest([batch([span({ traceId: t, spanId: hex(8), name: "agent", kind: "workflow" })])]));
+    const origin = { origin: tb.url.replace("127.0.0.1", "localhost") };
+    const count = async (limit: string) => {
+      const r = await fetch(`${tb.url}/api/search/runs?limit=${limit}`, { headers: origin });
+      expect(r.status).toBe(200); // was a 200 with no runs for limit=abc (slice(0, NaN))
+      return ((await r.json()) as { runs: unknown[] }).runs.length;
+    };
+    expect(await count("abc")).toBe(3); // not a number: default limit; was none
+    expect(await count("-5")).toBe(1); // clamp this too; was none (slice(0, -5))
+    expect(await count("2")).toBe(2);
+  });
+
+  it("clamps the chat events cursor instead of dropping every event for a bad value", async () => {
+    const tb = await served();
+    const id = tb.roots.chats.create({ agent: "claude", cwd: os.tmpdir() }).id;
+    const ins = tb.roots.store.db.prepare("INSERT INTO chat_events (session_id, seq, json) VALUES (?, ?, ?)");
+    for (const seq of [1, 2]) ins.run(id, seq, JSON.stringify({ seq, at: seq, kind: "text", text: `m${seq}` }));
+    const count = async (after: string) => {
+      const r = await fetch(`${tb.url}/api/chat/sessions/${id}${after}`, { headers: { origin: tb.url.replace("127.0.0.1", "localhost") } });
+      expect(r.status).toBe(200); // was a 200 with no events for after=abc (seq > NaN)
+      return ((await r.json()) as { events: unknown[] }).events.length;
+    };
+    expect(await count("")).toBe(2);
+    expect(await count("?after=1")).toBe(1);
+    expect(await count("?after=abc")).toBe(2); // not a number: from the start; was none
   });
 
   it("returns 404 JSON for unknown /api and /v1 routes, not the SPA", async () => {

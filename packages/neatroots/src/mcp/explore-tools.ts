@@ -168,7 +168,8 @@ export const EXPLORE_TOOLS = [
     input: {},
     run: async (roots) =>
       roots.store.db
-        .prepare("SELECT project, COUNT(*) AS runs, SUM(open_finding_count > 0) AS with_problems, SUM(status = 'failed') AS failed, MAX(started_ms) AS last_ms FROM runs WHERE doctor = 0 GROUP BY project ORDER BY last_ms DESC")
+        // Runs store ok/error/interrupted, so count the two statuses the app shows as failed.
+        .prepare("SELECT project, COUNT(*) AS runs, SUM(open_finding_count > 0) AS with_problems, SUM(status IN ('error', 'interrupted')) AS failed, MAX(started_ms) AS last_ms FROM runs WHERE doctor = 0 GROUP BY project ORDER BY last_ms DESC")
         .all(),
   }),
   def({

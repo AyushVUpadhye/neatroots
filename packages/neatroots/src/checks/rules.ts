@@ -42,6 +42,36 @@ function clip(s: string, n = 120): string {
   return s.length > n ? s.slice(0, n - 1) + "…" : s;
 }
 
+/** How much of a field a `match` rule reads, across all the texts it reads from it. */
+const MATCH_CHARS = 200_000;
+
+/**
+ * The texts a `match` rule reads from a field: each text item of an MCP tool result, read like
+ * a plain string output, then the field itself (as JSON when it isn't a string).
+ * JSON.stringify escapes the quotes inside `content[].text`, so `"error":` there reads as
+ * `\"error\":` and a pattern written for plain output would never see it. All texts share one
+ * MATCH_CHARS budget, so the text items, which are the tool's real output, are read first.
+ */
+function matchTexts(v: unknown): string[] {
+  const texts: string[] = [];
+  let budget = MATCH_CHARS;
+  const add = (text: string): void => {
+    if (budget <= 0) return;
+    const clipped = text.slice(0, budget);
+    texts.push(clipped);
+    budget -= clipped.length;
+  };
+  const content = v && typeof v === "object" && !Array.isArray(v) ? (v as { content?: unknown }).content : undefined;
+  if (Array.isArray(content)) {
+    for (const item of content) {
+      const part = item && typeof item === "object" ? (item as { type?: unknown; text?: unknown }) : undefined;
+      if (part?.type === "text" && typeof part.text === "string") add(part.text);
+    }
+  }
+  add(typeof v === "string" ? v : JSON.stringify(v));
+  return texts;
+}
+
 /**
  * Evaluates one rule against a trace. Returns null when the rule has never held in this
  * trace; otherwise `firing` says whether it still holds for the newest spans, which is how
@@ -153,8 +183,10 @@ export function evaluateRule(check: RuleCheck, t: TraceSnapshot, atEnd: boolean,
       const hits = selectSpans(t.spans, r.span).filter((s) => {
         const v = r.field === "input" ? s.input : r.field === "output" ? s.output : r.field === "error" ? s.error : s.name;
         if (v === undefined || v === null) return false;
-        re.lastIndex = 0;
-        return re.test(typeof v === "string" ? v : JSON.stringify(v));
+        return matchTexts(v).some((text) => {
+          re.lastIndex = 0;
+          return re.test(text);
+        });
       });
       if (!hits.length) return null;
       return { firing: true, evidenceSpanIds: hits.map((s) => s.id), params: { count: String(hits.length), span: hits[0].ref } };
