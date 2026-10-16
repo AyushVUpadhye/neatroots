@@ -56,33 +56,71 @@ export function parseChecks(text: string): { checks: Check[]; errors: { id?: str
   return { checks, errors };
 }
 
-/**
- * Removes every check with this id from a checks file and leaves the rest as written: other
- * documents keep their exact text, and the edited one keeps its comments and any entries that
- * don't validate (yet).
- */
-function removeFromYaml(text: string, id: string): string {
-  const isOurs = (n: unknown) => YAML.isMap(n) && n.get("id") === id;
-  let out = "";
-  let at = 0;
-  for (const [i, doc] of YAML.parseAllDocuments(text).entries()) {
+interface FoundCheck {
+  doc: YAML.Document.Parsed;
+  node: YAML.YAMLMap;
+  /** The list holding the check; undefined when the check is the whole document. */
+  list?: YAML.YAMLSeq;
+}
+
+/** Every check with this id in a checks file: a document of its own, or an entry of a list or `checks:`. */
+function findChecks(text: string, id: string): FoundCheck[] {
+  const isOurs = (n: unknown): n is YAML.YAMLMap => YAML.isMap(n) && n.get("id") === id && !!n.range;
+  const found: FoundCheck[] = [];
+  for (const doc of YAML.parseAllDocuments(text)) {
     if (doc.errors.length) continue;
     const contents = doc.contents;
+    if (isOurs(contents)) {
+      found.push({ doc, node: contents });
+      continue;
+    }
     const wrapped = YAML.isMap(contents) ? contents.get("checks", true) : undefined;
     const list = YAML.isSeq(contents) ? contents : YAML.isSeq(wrapped) ? wrapped : undefined;
-    let next: string | undefined;
-    if (isOurs(contents)) next = "";
-    else if (list?.items.some(isOurs)) {
-      list.items = list.items.filter((n) => !isOurs(n));
-      next = doc.toString();
-    }
-    if (next === undefined) continue;
-    // The first document also owns any comments above it.
-    const start = i === 0 ? 0 : doc.range[0];
-    out += text.slice(at, start) + next;
-    at = doc.range[2];
+    for (const node of list?.items ?? []) if (isOurs(node)) found.push({ doc, node, list });
   }
-  return out + text.slice(at);
+  return found;
+}
+
+/** The text a check takes up: its document, its "- " entry, or its flow entry and one comma. */
+function textOf(text: string, { doc, node, list }: FoundCheck): [number, number] {
+  const [start, end] = node.range!;
+  if (!list) return [doc.range[0], doc.range[2]];
+  if (list.flow) {
+    const after = /^\s*,\s*/.exec(text.slice(end));
+    if (after) return [start, end + after[0].length];
+    const before = /,\s*$/.exec(text.slice(0, start));
+    return [before ? before.index : start, end];
+  }
+  // A block entry runs from the start of its "- " line to the end of its last line.
+  const marker = /(^|\n)[ \t]*-\s+$/.exec(text.slice(0, start));
+  return [marker ? marker.index + marker[1].length : start, end];
+}
+
+/**
+ * Cuts every check with this id out of a checks file; all other text stays exactly as written:
+ * comments, other checks (including ones that don't validate yet) and other documents. Throws when
+ * another check uses a YAML anchor the removed one defines, since that check would stop loading.
+ */
+function removeFromYaml(text: string, id: string): string {
+  const found = findChecks(text, id);
+  const removed = (pos: number) => found.some(({ node }) => pos >= node.range![0] && pos < node.range![1]);
+  for (const { doc, node, list } of found) {
+    const anchors = new Set<string>();
+    YAML.visit(node, { Node: (_, n) => void (n.anchor && anchors.add(n.anchor)) });
+    if (node.anchor) anchors.add(node.anchor);
+    if (!anchors.size) continue;
+    YAML.visit(doc, {
+      Alias: (_, a) => {
+        if (!anchors.has(a.source) || !a.range || removed(a.range[0])) return;
+        const user = list?.items.find((n) => YAML.isMap(n) && n.range && a.range![0] >= n.range[0] && a.range![0] < n.range[1]);
+        const name = YAML.isMap(user) ? `check ${String(user.get("id"))}` : "another check";
+        throw new Error(`can't delete check ${id}: ${name} uses its YAML anchor &${a.source}. Replace *${a.source} there with the value, then delete ${id}.`);
+      },
+    });
+  }
+  let out = text;
+  for (const [start, end] of found.map((f) => textOf(text, f)).reverse()) out = out.slice(0, start) + out.slice(end);
+  return out;
 }
 
 /**
@@ -91,17 +129,7 @@ function removeFromYaml(text: string, id: string): string {
  * Returns undefined when the file has no check with this id.
  */
 function replaceInYaml(text: string, check: Check): string | undefined {
-  const isOurs = (n: unknown): n is YAML.YAMLMap => YAML.isMap(n) && n.get("id") === check.id;
-  const spans: { start: number; end: number; node: YAML.YAMLMap }[] = [];
-  for (const doc of YAML.parseAllDocuments(text)) {
-    if (doc.errors.length) continue;
-    const contents = doc.contents;
-    const wrapped = YAML.isMap(contents) ? contents.get("checks", true) : undefined;
-    const list = YAML.isSeq(contents) ? contents : YAML.isSeq(wrapped) ? wrapped : undefined;
-    for (const node of isOurs(contents) ? [contents] : (list?.items ?? [])) {
-      if (isOurs(node) && node.range) spans.push({ start: node.range[0], end: node.range[1], node });
-    }
-  }
+  const spans = findChecks(text, check.id).map(({ node }) => ({ start: node.range![0], end: node.range![1], node }));
   if (!spans.length) return undefined;
   const eol = text.includes("\r\n") ? "\r\n" : "\n";
   let out = text;

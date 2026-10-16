@@ -27,13 +27,11 @@ const write = (name: string, text: string) => fs.writeFileSync(path.join(checks,
 const read = (name: string) => fs.readFileSync(path.join(checks, name), "utf8");
 
 // A check that no longer validates (flag_at_level is outside its two levels) stays in the file
-// until someone fixes it; deleting a neighbour must not delete it too.
-const team = `# Team checks for the refund agent
-
-- id: too-many-lookups
-  kind: rule
-  rule: { type: count, span: { type: tool, name: lookup_order }, at_least: 5 }
-# WIP: fix the scale before turning this on
+// until someone fixes it; deleting a neighbour must not delete it too. The neighbours are written
+// the way people write them (compact flow maps, a long line), not the way the stringifier would.
+const header = "# Team checks for the refund agent\n\n";
+const lookups = "- id: too-many-lookups\n  kind: rule\n  rule: {type: count, span: {type: tool, name: lookup_order}, at_least: 5} # five is plenty\n";
+const rest = `# WIP: fix the scale before turning this on
 - id: refund-tone
   kind: score
   ask: How rude was the reply?
@@ -41,19 +39,18 @@ const team = `# Team checks for the refund agent
   flag_at_level: 7
 - id: no-refund-loop
   kind: rule
-  rule: { type: repeat, span: { type: tool, name: issue_refund }, same: [tool, input], at_least: 2 }
+  rule: {type: repeat, span: {type: tool, name: issue_refund}, same: [tool, input], at_least: 2}
+  guidance: You have issued the same refund {count} times already; check the order status before you try it again.
 `;
+const team = header + lookups + rest;
 
-it("deleting a check keeps the rest of its file, including checks that don't validate and comments", () => {
+it("deleting a check cuts out only its own text, keeping the rest of the file byte for byte", () => {
   write("refunds.yaml", team);
   const r = registry();
   expect(r.errors.map((e) => e.id)).toEqual(["refund-tone"]);
   expect(r.remove("too-many-lookups")).toBe(true);
   const text = read("refunds.yaml");
-  expect(text).not.toContain("too-many-lookups");
-  expect(text).toContain("# Team checks for the refund agent");
-  expect(text).toContain("# WIP: fix the scale before turning this on\n- id: refund-tone");
-  expect(text).toContain("flag_at_level: 7");
+  expect(text).toBe(header + rest);
   const left = parseChecks(text);
   expect(left.checks.map((c) => c.id)).toEqual(["no-refund-loop"]);
   expect(left.errors.map((e) => e.id)).toEqual(["refund-tone"]);
@@ -91,16 +88,51 @@ it("edits only the document holding the check and leaves the other documents as 
   );
   const r = registry();
   r.remove("second");
-  let text = read("mixed.yaml");
-  expect(text).toContain("- id: first # keep me");
-  expect(text).not.toContain("second");
-  expect(text).toContain(broken);
-  expect(text.endsWith(single)).toBe(true);
+  const first = "checks:\n  - id: first # keep me\n    kind: rule\n    rule: {type: count, span: {type: llm}, at_least: 9}\n";
+  expect(read("mixed.yaml")).toBe(first + broken + single);
   r.remove("single");
-  text = read("mixed.yaml");
-  expect(text).not.toContain("id: single");
-  expect(text).toContain(broken);
-  expect(parseChecks(text).checks.map((c) => c.id)).toEqual(["first"]);
+  expect(read("mixed.yaml")).toBe(first + broken);
+  expect(parseChecks(read("mixed.yaml")).checks.map((c) => c.id)).toEqual(["first"]);
+});
+
+it("takes a check out of a flow list with its comma and leaves the others as written", () => {
+  const a = "{id: a, kind: rule, rule: {type: count, span: {type: tool}, at_least: 1}}";
+  const b = "{id: b, kind: rule, rule: {type: count, span: {type: llm}, at_least: 2}}";
+  const c = "{id: c, kind: rule, rule: {type: count, span: {type: tool}, at_least: 3}}";
+  write("flow.yaml", `[ ${a}, ${b},\n  ${c} ]\n`);
+  const r = registry();
+  r.remove("b");
+  expect(read("flow.yaml")).toBe(`[ ${a}, ${c} ]\n`);
+  r.remove("c");
+  expect(read("flow.yaml")).toBe(`[ ${a} ]\n`);
+  expect(r.get("a")).toBeDefined();
+});
+
+// rule: &shared … rule: *shared
+const anchored = `- id: owner
+  kind: rule
+  rule: &shared {type: count, span: {type: tool}, at_least: 3}
+- id: borrower
+  kind: rule
+  rule: *shared
+`;
+
+it("refuses to delete a check whose YAML anchor another check uses, and changes nothing", () => {
+  write("anchors.yaml", anchored);
+  const r = registry();
+  expect(r.get("borrower")).toBeDefined();
+  expect(() => r.remove("owner")).toThrow(/&shared.*borrower|borrower.*&shared/);
+  expect(read("anchors.yaml")).toBe(anchored);
+  expect(r.get("owner")).toBeDefined();
+  expect(r.get("borrower")).toBeDefined();
+});
+
+it("deletes the check that uses an anchor and keeps the one that defines it", () => {
+  write("anchors.yaml", anchored);
+  const r = registry();
+  expect(r.remove("borrower")).toBe(true);
+  expect(read("anchors.yaml")).toBe("- id: owner\n  kind: rule\n  rule: &shared {type: count, span: {type: tool}, at_least: 3}\n");
+  expect(r.get("owner")).toBeDefined();
 });
 
 it("leaves a file alone when the check was already edited out of it by hand", () => {
@@ -117,8 +149,22 @@ it("DELETE /api/checks/:id keeps the other checks in a project file", async () =
   try {
     const res = await fetch(`${t.url}/api/checks/too-many-lookups`, { method: "DELETE" });
     expect(res.status).toBe(200);
-    expect(read("refunds.yaml")).toContain("id: refund-tone");
+    expect(read("refunds.yaml")).toBe(header + rest);
     expect(t.roots.checks.get("no-refund-loop")).toBeDefined();
+  } finally {
+    await t.close();
+  }
+});
+
+it("DELETE /api/checks/:id explains why a check whose anchor is in use can't be deleted", async () => {
+  write("anchors.yaml", anchored);
+  const t = await makeRoots({ serve: true, noEngine: true, config: (c) => (c.checkDirs = [checks]) });
+  try {
+    const res = await fetch(`${t.url}/api/checks/owner`, { method: "DELETE" });
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { error: string }).error).toMatch(/&shared/);
+    expect(read("anchors.yaml")).toBe(anchored);
+    expect(t.roots.checks.get("borrower")).toBeDefined();
   } finally {
     await t.close();
   }
@@ -129,5 +175,5 @@ it("removes every copy of the id in the file, so an earlier duplicate doesn't co
   const r = registry();
   r.remove("dup");
   expect(r.get("dup")).toBeUndefined();
-  expect(parseChecks(read("dupes.yaml")).checks.map((c) => c.id)).toEqual(["other"]);
+  expect(read("dupes.yaml")).toBe("- id: other\n  kind: rule\n  rule: {type: count, span: {type: tool}, at_least: 2}\n");
 });
