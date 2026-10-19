@@ -256,3 +256,14 @@ it.skipIf(process.platform === "win32" || process.getuid?.() === 0)("DELETE /api
     await t.close();
   }
 });
+
+it("keeps a comment on the entry before a deleted last flow entry", () => {
+  const a = "{id: a, kind: rule, rule: {type: count, span: {type: tool}, at_least: 1}}";
+  const x = "{id: x, kind: rule, rule: {type: count, span: {type: llm}, at_least: 2}}";
+  write("flow-comment.yaml", `[${a}, # note, about a\n ${x}]\n`);
+  const r = registry();
+  expect(r.remove("x")).toBe(true);
+  expect(read("flow-comment.yaml")).toBe(`[${a} # note, about a\n ]\n`);
+  expect(r.get("a")).toBeDefined();
+  expect(r.errors).toEqual([]);
+});

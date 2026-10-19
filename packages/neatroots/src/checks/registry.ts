@@ -150,9 +150,10 @@ function textOf(text: string, { doc, node, list }: FoundCheck): [number, number]
 
 /**
  * The text to cut from a flow list `[a, x, x, b]`: each run of removed entries, with the comma after
- * it, or for a run at the end of the list the comma before it, so `[a, x, x]` becomes `[a]`.
+ * it, or for a run at the end of the list the comma before it, so `[a, x, x]` becomes `[a]`. A
+ * comment after that comma belongs to the entry before it (`[a, # note` …) and stays.
  */
-function flowCuts(list: YAML.YAMLSeq, gone: (n: unknown) => boolean): { start: number; end: number; with: string }[] {
+function flowCuts(text: string, list: YAML.YAMLSeq, gone: (n: unknown) => boolean): { start: number; end: number; with: string }[] {
   const range = (n: unknown) => (n as YAML.Node).range!;
   const items = list.items;
   const cuts: { start: number; end: number; with: string }[] = [];
@@ -161,7 +162,16 @@ function flowCuts(list: YAML.YAMLSeq, gone: (n: unknown) => boolean): { start: n
     let j = i;
     while (j + 1 < items.length && gone(items[j + 1])) j++;
     if (j + 1 < items.length) cuts.push({ start: range(items[i])[0], end: range(items[j + 1])[0], with: "" });
-    else if (i > 0) cuts.push({ start: range(items[i - 1])[1], end: range(items[j])[1], with: "" });
+    else if (i > 0) {
+      const prevEnd = range(items[i - 1])[1];
+      const gap = text.slice(prevEnd, range(items[i])[0]);
+      // The separator comma, skipping comment text (between entries, every # starts a comment).
+      let k = 0;
+      for (; k < gap.length && gap[k] !== ","; k++) if (gap[k] === "#") k = gap.includes("\n", k) ? gap.indexOf("\n", k) : gap.length;
+      if (gap.includes("#") && k < gap.length) {
+        cuts.push({ start: prevEnd + k, end: prevEnd + k + 1, with: "" }, { start: range(items[i])[0], end: range(items[j])[1], with: "" });
+      } else cuts.push({ start: prevEnd, end: range(items[j])[1], with: "" });
+    }
     else cuts.push({ start: range(items[i])[0], end: range(items[j])[1], with: "" });
     i = j;
   }
@@ -218,7 +228,7 @@ function removeFromYaml(text: string, id: string): string {
   }
   const cuts: { start: number; end: number; with: string }[] = [];
   const flowLists = new Set(found.flatMap((f) => (f.list?.flow ? [f.list] : [])));
-  for (const list of flowLists) cuts.push(...flowCuts(list, (n) => found.some((g) => g.node === n)));
+  for (const list of flowLists) cuts.push(...flowCuts(text, list, (n) => found.some((g) => g.node === n)));
   for (const f of found) {
     if (f.list?.flow) continue;
     const [start, end] = textOf(text, f);
