@@ -229,3 +229,30 @@ it("refuses a delete that would change what the rest of the file loads, and leav
     await t.close();
   }
 });
+
+it("deletes duplicate neighbours from a flow list, where their commas overlap", () => {
+  const b = "{id: b, kind: rule, rule: {type: count, span: {type: tool}, at_least: 1}}";
+  const x1 = "{id: x, kind: rule, rule: {type: count, span: {type: llm}, at_least: 2}}";
+  const x2 = "{id: x, kind: rule, rule: {type: count, span: {type: tool}, at_least: 3}}";
+  write("flow-dupes.yaml", `[ ${b}, ${x1}, ${x2} ]\n`);
+  const r = registry();
+  expect(r.remove("x")).toBe(true);
+  expect(read("flow-dupes.yaml")).toBe(`[ ${b} ]\n`);
+  expect(r.get("x")).toBeUndefined();
+  expect(r.get("b")).toBeDefined();
+});
+
+it.skipIf(process.platform === "win32" || process.getuid?.() === 0)("DELETE /api/checks/:id answers a file it can't write with a 500, not a 409", async () => {
+  write("refunds.yaml", team);
+  fs.chmodSync(path.join(checks, "refunds.yaml"), 0o444);
+  const t = await makeRoots({ serve: true, noEngine: true, config: (c) => (c.checkDirs = [checks]) });
+  try {
+    const res = await fetch(`${t.url}/api/checks/too-many-lookups`, { method: "DELETE" });
+    expect(res.status).toBe(500);
+    expect(((await res.json()) as { error: string }).error).toBe("internal error");
+    expect(read("refunds.yaml")).toBe(team);
+  } finally {
+    fs.chmodSync(path.join(checks, "refunds.yaml"), 0o644);
+    await t.close();
+  }
+});

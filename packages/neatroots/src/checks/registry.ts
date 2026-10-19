@@ -139,19 +139,33 @@ function findChecks(text: string, id: string): FoundCheck[] {
   return found;
 }
 
-/** The text a check takes up: its document, its "- " entry, or its flow entry and one comma. */
+/** The text a check takes up: its document or its "- " entry (flow entries are cut by flowCuts). */
 function textOf(text: string, { doc, node, list }: FoundCheck): [number, number] {
   const [start, end] = node.range!;
   if (!list) return [doc.range[0], doc.range[2]];
-  if (list.flow) {
-    const after = /^\s*,\s*/.exec(text.slice(end));
-    if (after) return [start, end + after[0].length];
-    const before = /,\s*$/.exec(text.slice(0, start));
-    return [before ? before.index : start, end];
-  }
   // A block entry runs from the start of its "- " line (which may carry a comment) to the end of its last line.
   const marker = /(^|\n)[ \t]*-[ \t]*(#[^\n]*)?\s+$/.exec(text.slice(0, start));
   return [marker ? marker.index + marker[1].length : start, end];
+}
+
+/**
+ * The text to cut from a flow list `[a, x, x, b]`: each run of removed entries, with the comma after
+ * it, or for a run at the end of the list the comma before it, so `[a, x, x]` becomes `[a]`.
+ */
+function flowCuts(list: YAML.YAMLSeq, gone: (n: unknown) => boolean): { start: number; end: number; with: string }[] {
+  const range = (n: unknown) => (n as YAML.Node).range!;
+  const items = list.items;
+  const cuts: { start: number; end: number; with: string }[] = [];
+  for (let i = 0; i < items.length; i++) {
+    if (!gone(items[i])) continue;
+    let j = i;
+    while (j + 1 < items.length && gone(items[j + 1])) j++;
+    if (j + 1 < items.length) cuts.push({ start: range(items[i])[0], end: range(items[j + 1])[0], with: "" });
+    else if (i > 0) cuts.push({ start: range(items[i - 1])[1], end: range(items[j])[1], with: "" });
+    else cuts.push({ start: range(items[i])[0], end: range(items[j])[1], with: "" });
+    i = j;
+  }
+  return cuts;
 }
 
 /** The checks and load errors a file yields, other than this id's, comparable before and after an edit. */
@@ -176,6 +190,9 @@ function holdsNothing(text: string): boolean {
   });
 }
 
+/** A check can't be deleted without changing other checks in its file; the file is left as it is. */
+export class CheckRemoveConflict extends Error {}
+
 /**
  * Cuts every check with this id out of a checks file; all other text stays exactly as written:
  * comments, other checks (including ones that don't validate yet) and other documents. Throws when
@@ -195,12 +212,15 @@ function removeFromYaml(text: string, id: string): string {
         if (!anchors.has(a.source) || !a.range || removed(a.range[0])) return;
         const user = list?.items.find((n) => YAML.isMap(n) && n.range && a.range![0] >= n.range[0] && a.range![0] < n.range[1]);
         const name = YAML.isMap(user) ? `check ${String(user.get("id"))}` : "another check";
-        throw new Error(`can't delete check ${id}: ${name} uses its YAML anchor &${a.source}. Replace *${a.source} there with the value, then delete ${id}.`);
+        throw new CheckRemoveConflict(`can't delete check ${id}: ${name} uses its YAML anchor &${a.source}. Replace *${a.source} there with the value, then delete ${id}.`);
       },
     });
   }
   const cuts: { start: number; end: number; with: string }[] = [];
+  const flowLists = new Set(found.flatMap((f) => (f.list?.flow ? [f.list] : [])));
+  for (const list of flowLists) cuts.push(...flowCuts(list, (n) => found.some((g) => g.node === n)));
   for (const f of found) {
+    if (f.list?.flow) continue;
     const [start, end] = textOf(text, f);
     const list = f.list;
     // Emptying a block `checks:` list would leave `checks:` with no value, which doesn't load; it
@@ -217,10 +237,20 @@ function removeFromYaml(text: string, id: string): string {
     }
     cuts.push({ start, end, with: "" });
   }
+  // Cuts are offsets into the original text; any that overlap are merged first, so none is made
+  // with offsets a previous cut has moved.
+  const merged: typeof cuts = [];
+  for (const c of cuts.sort((a, b) => a.start - b.start)) {
+    const last = merged.at(-1);
+    if (last && c.start < last.end) {
+      last.with += c.with;
+      last.end = Math.max(last.end, c.end);
+    } else merged.push({ ...c });
+  }
   let out = text;
-  for (const c of cuts.sort((a, b) => b.start - a.start)) out = out.slice(0, c.start) + c.with + out.slice(c.end);
+  for (const c of merged.reverse()) out = out.slice(0, c.start) + c.with + out.slice(c.end);
   if (otherContent(out, id) !== otherContent(text, id) || parseChecks(out).checks.some((c) => c.id === id)) {
-    throw new Error(`can't delete check ${id} without changing other checks in its file, so the file was left as it is. Remove it from the file by hand.`);
+    throw new CheckRemoveConflict(`can't delete check ${id} without changing other checks in its file, so the file was left as it is. Remove it from the file by hand.`);
   }
   return out;
 }
