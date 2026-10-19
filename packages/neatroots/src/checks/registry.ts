@@ -143,8 +143,9 @@ function findChecks(text: string, id: string): FoundCheck[] {
 function textOf(text: string, { doc, node, list }: FoundCheck): [number, number] {
   const [start, end] = node.range!;
   if (!list) return [doc.range[0], doc.range[2]];
-  // A block entry runs from the start of its "- " line (which may carry a comment) to the end of its last line.
-  const marker = /(^|\n)[ \t]*-[ \t]*(#[^\n]*)?\s+$/.exec(text.slice(0, start));
+  // A block entry runs from the start of its "- " line to the end of its last line. Comments on the
+  // dash line, or on lines between the dash and the check's first key, go with it.
+  const marker = /(^|\n)[ \t]*-(?:[ \t]*(?:#[^\n]*)?\r?\n)*[ \t]*$/.exec(text.slice(0, start));
   return [marker ? marker.index + marker[1].length : start, end];
 }
 
@@ -233,19 +234,19 @@ function removeFromYaml(text: string, id: string): string {
     if (f.list?.flow) continue;
     const [start, end] = textOf(text, f);
     const list = f.list;
-    // Emptying a block `checks:` list would leave `checks:` with no value, which doesn't load; it
-    // becomes `checks: []` instead (at the first entry's dash, so its indentation stays valid).
-    if (list && !list.flow && list !== f.doc.contents && list.items.every((n) => found.some((g) => g.node === n))) {
-      if (f.node !== list.items[0]) {
-        cuts.push({ start, end, with: "" });
-        continue;
-      }
-      const dash = start + /^[ \t]*/.exec(text.slice(start))![0].length;
-      const eol = text.includes("\r\n") ? "\r\n" : "\n";
-      cuts.push({ start: dash, end, with: `[]${eol}` });
-      continue;
-    }
     cuts.push({ start, end, with: "" });
+    // Emptying a block `checks:` list would leave `checks:` with no value, which doesn't load; it
+    // becomes `checks: []`, written on the key's own line (after any anchor or tag, before any
+    // comment) so it is valid however the list was indented.
+    if (list && list !== f.doc.contents && f.node === list.items[0] && list.items.every((n) => found.some((g) => g.node === n))) {
+      const pair = YAML.isMap(f.doc.contents) ? f.doc.contents.items.find((p) => p.value === list) : undefined;
+      const keyEnd = (pair?.key as YAML.Node | undefined)?.range?.[1];
+      if (keyEnd === undefined) continue;
+      const lineEnd = /\r?\n|$/.exec(text.slice(keyEnd))!.index;
+      const rest = text.slice(keyEnd, keyEnd + lineEnd);
+      const at = keyEnd + rest.slice(0, /\s#|$/.exec(rest)!.index).trimEnd().length;
+      cuts.push({ start: at, end: at, with: " []" });
+    }
   }
   // Cuts are offsets into the original text; any that overlap are merged first, so none is made
   // with offsets a previous cut has moved.

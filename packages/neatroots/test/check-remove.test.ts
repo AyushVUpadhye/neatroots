@@ -194,7 +194,7 @@ it("keeps a valid checks: [] when the file has more than the list, and the last 
   r.remove("a");
   expect(read("wrapped.yaml")).toBe(`version: 2\nchecks:\n${rule("b", 2)}`);
   r.remove("b");
-  expect(read("wrapped.yaml")).toBe("version: 2\nchecks:\n  []\n");
+  expect(read("wrapped.yaml")).toBe("version: 2\nchecks: []\n");
   const left = parseChecks(read("wrapped.yaml"));
   expect(left).toEqual({ checks: [], errors: [] });
   expect(r.errors).toEqual([]);
@@ -210,10 +210,46 @@ it("takes a comment on the check's own - line with it, so the next check still l
   expect(r.errors).toEqual([]);
 });
 
+it("takes comment lines between the dash and the check's first key with it", () => {
+  const a = rule("a", 1, "");
+  write("commented.yaml", `-\n  # the b check\n\n  # still b\n  id: b\n  kind: rule\n  rule: {type: count, span: {type: tool}, at_least: 2}\n${a}`);
+  const r = registry();
+  expect(r.remove("b")).toBe(true);
+  expect(read("commented.yaml")).toBe(a);
+  expect(r.errors).toEqual([]);
+});
+
+it("writes checks: [] on the key's line, after an anchor or tag and before a comment, however the list was indented", () => {
+  const r0 = (id: string) => `- id: ${id}\n  kind: rule\n  rule: {type: count, span: {type: tool}, at_least: 1}\n`;
+  write("indentless.yaml", `owner: team\nchecks:\n${r0("a")}`);
+  write("commented-key.yaml", `owner: team\nchecks: &list # the team's list\n${rule("b", 2)}`);
+  write("tagged.yaml", `owner: team\nchecks: !!seq\n${rule("c", 3)}`);
+  const r = registry();
+  r.remove("a");
+  r.remove("b");
+  r.remove("c");
+  expect(read("indentless.yaml")).toBe("owner: team\nchecks: []\n");
+  expect(read("commented-key.yaml")).toBe("owner: team\nchecks: &list [] # the team's list\n");
+  expect(read("tagged.yaml")).toBe("owner: team\nchecks: !!seq []\n");
+  expect(r.errors).toEqual([]);
+});
+
+it("leaves the line endings of a CRLF file as they were", () => {
+  const crlf = (s: string) => s.replace(/\n/g, "\r\n");
+  write("crlf.yaml", crlf(`# team\nchecks:\n- # the a check\n  id: a\n  kind: rule\n  rule: {type: count, span: {type: tool}, at_least: 1}\n${rule("b", 2, "")}`));
+  write("crlf-last.yaml", crlf(`version: 2\nchecks:\n${rule("c", 3)}`));
+  const r = registry();
+  r.remove("a");
+  r.remove("c");
+  expect(read("crlf.yaml")).toBe(crlf(`# team\nchecks:\n${rule("b", 2, "")}`));
+  expect(read("crlf-last.yaml")).toBe("version: 2\r\nchecks: []\r\n");
+  expect(r.errors).toEqual([]);
+});
+
 it("refuses a delete that would change what the rest of the file loads, and leaves the file as it is", async () => {
-  // A comment line between the dash and the check's first key: cutting the check would leave a
-  // bare "-" (a null entry) in front of the next check.
-  const text = `-\n  # the b check\n  id: b\n  kind: rule\n  rule: {type: count, span: {type: tool}, at_least: 2}\n${rule("a", 1, "")}`;
+  // An anchor on the dash line isn't part of the entry's cut: cutting the check would leave a
+  // bare "- &spare" (a null entry) in front of the next check.
+  const text = `- &spare\n  id: b\n  kind: rule\n  rule: {type: count, span: {type: tool}, at_least: 2}\n${rule("a", 1, "")}`;
   write("odd.yaml", text);
   const r = registry();
   expect(() => r.remove("b")).toThrow(/without changing other checks/);
