@@ -396,6 +396,8 @@ export function mountApi(app: Hono, roots: Roots): void {
         if (event === "finding" || event === "note") data.id = p.id;
         if (event === "settings") data.project = p.project ?? null;
         if (event === "navigate") data.path = p.path;
+        // The app refreshes cloud pushes on activity whose kind starts with "push".
+        if (event === "activity") data.kind = p.kind;
         if (event === "chat") Object.assign(data, { session_id: p.session_id, event: p.event, state: p.state });
         if (event === "import" || event === "replay") Object.assign(data, p);
         queue.push({ event, data: JSON.stringify(data) });
@@ -501,8 +503,8 @@ export function mountApi(app: Hono, roots: Roots): void {
     } else if (c.req.param("action") === "confirm") {
       // Set before the send starts: another confirm can't send the runs again, nor a decline say nothing was sent.
       p.status = "sending";
-      roots.bus.emit("activity", { kind: "push", message: p.status });
       try {
+        roots.bus.emit("activity", { kind: "push", message: p.status });
         const row = await roots.relay.forward(p.trace_ids, "coding-agent (confirmed)");
         p.status = row.status === "ok" ? "sent" : "failed";
         p.forward_id = row.id;

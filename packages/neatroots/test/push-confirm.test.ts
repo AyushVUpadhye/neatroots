@@ -75,6 +75,38 @@ it("marks a push failed, not sending, when the send throws", async () => {
   expect(cloud.seen.requests).toBe(0);
 });
 
+it("tells open tabs about a push request and its send, so they refresh the banner", async () => {
+  const { tb, answer } = await setup(0);
+  const ac = new AbortController();
+  cleanup.push(() => ac.abort());
+  const reader = (await fetch(`${tb.url}/api/events`, { signal: ac.signal })).body!.getReader();
+  let text = "";
+  const read = async (until: (t: string) => boolean) => {
+    for (const end = Date.now() + 3000; !until(text) && Date.now() < end; ) text += new TextDecoder().decode((await reader.read()).value);
+  };
+  await read((t) => t.includes("event: hello"));
+  tb.roots.bus.emit("activity", { kind: "push-request", message: "push_x" });
+  await answer("confirm");
+  const kinds = () =>
+    text
+      .split("\n\n")
+      .filter((m) => m.includes("event: activity"))
+      .map((m) => JSON.parse(m.split("\n").find((l) => l.startsWith("data:"))!.slice(5)).kind);
+  await read(() => kinds().length >= 3);
+  // The app refetches pushes only for activity whose kind starts with "push"; the stream dropped the kind.
+  expect(kinds()).toEqual(["push-request", "push", "push"]);
+});
+
+it("doesn't leave a push sending when telling the app about the send fails", async () => {
+  const { tb, cloud, id, answer } = await setup(0);
+  tb.roots.bus.on("activity", (e) => {
+    if (e.message === "sending") throw new Error("listener broke");
+  });
+  await answer("confirm");
+  expect(tb.roots.pushes.get(id)).toMatchObject({ status: "failed", error: "listener broke" });
+  expect(cloud.seen.requests).toBe(0);
+});
+
 it("sends nothing for a push declined before it is confirmed", async () => {
   const { tb, cloud, id, answer } = await setup(0);
   expect((await answer("decline")).status).toBe("declined");
