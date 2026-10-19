@@ -35,32 +35,108 @@ const redirectError = (res: Response) =>
 const MARKER_ATTEMPTS = 3;
 const MARKER_BACKOFF_MS = 500;
 
+/**
+ * Auto-forward: the wait before a finished run is sent (so checks finish and findings travel with
+ * it), the first retry delay after a failure that may pass on its own (doubling, at most an hour),
+ * and how many sends are tried before giving up (about half an hour of retries).
+ */
+const AUTO_SETTLE_MS = 1500;
+const AUTO_RETRY_MS = 60_000;
+const AUTO_RETRY_CAP_MS = 3_600_000;
+const AUTO_ATTEMPTS = 6;
+
 export class Relay {
+  /** Wait before a queued run is first sent. */
+  settleMs = AUTO_SETTLE_MS;
+  /** First delay before a failed send is tried again. */
+  retryBaseMs = AUTO_RETRY_MS;
+  private timer?: NodeJS.Timeout;
+  private sending = new Set<string>();
+  private closed = false;
+
   constructor(private readonly roots: Roots) {
+    // Runs waiting to be auto-forwarded live in the store, so a failed send can be tried again and
+    // a restart doesn't lose them.
+    roots.store.db.exec("CREATE TABLE IF NOT EXISTS auto_forwards (trace_id TEXT PRIMARY KEY, attempts INTEGER NOT NULL DEFAULT 0, next_ms INTEGER NOT NULL)");
     roots.bus.on("trace", (u) => {
-      if (!u.rootEnded && !u.completed) return;
+      if (this.closed || (!u.rootEnded && !u.completed)) return;
       const run = roots.store.getRun(u.traceId);
       if (!run || run.doctor || !run.project) return;
       if (!projectSettings(roots.config, run.project).forward) return;
-      void this.autoForward(u.traceId);
+      // Imported runs are never sent back automatically (docs/cloud.md). Imports mark their resource
+      // with neatroots.import.source; "http" (the live /v1/trace API) and "replay" aren't imports,
+      // as in importSource().
+      const imported = [...new Set(u.spans.map((s) => s.row.resource_id))].some((id) =>
+        roots.store.getResource(id).attributes.some((a) => a.key === "neatroots.import.source" && "stringValue" in a.value && a.value.stringValue !== "http" && a.value.stringValue !== "replay"),
+      );
+      if (imported) return;
+      roots.store.db.prepare("INSERT OR IGNORE INTO auto_forwards (trace_id, attempts, next_ms) VALUES (?, 0, ?)").run(u.traceId, Date.now() + this.settleMs);
+      this.schedule();
     });
   }
 
-  private pendingAuto = new Set<string>();
+  /** Sends the runs a previous neatroots queued for auto-forward but didn't get to (a restart or a crash). */
+  resume(): void {
+    if (this.closed) return;
+    this.roots.store.db.prepare("UPDATE auto_forwards SET next_ms = MIN(next_ms, ?)").run(Date.now() + this.settleMs);
+    this.schedule();
+  }
 
-  private async autoForward(traceId: string): Promise<void> {
-    if (this.pendingAuto.has(traceId)) return;
-    this.pendingAuto.add(traceId);
-    try {
-      // Let checks finish so findings travel with the run.
-      await new Promise((r) => setTimeout(r, 1500));
-      if (this.roots.engine) await this.roots.engine.waitIdle(traceId, 120_000);
-      if (this.roots.store.forwardedTraceIds().has(traceId)) return;
-      const res = await this.forward([traceId], "auto");
-      if (res.status !== "ok") log.warn(`auto-forward of ${traceId.slice(0, 8)} failed: ${res.error}`);
-    } finally {
-      this.pendingAuto.delete(traceId);
+  /** Stops auto-forwarding before the store closes; queued runs stay queued for the next start. */
+  close(): void {
+    this.closed = true;
+    clearTimeout(this.timer);
+  }
+
+  private queued(): { trace_id: string; attempts: number; next_ms: number }[] {
+    return this.roots.store.db.prepare("SELECT trace_id, attempts, next_ms FROM auto_forwards ORDER BY next_ms").all() as { trace_id: string; attempts: number; next_ms: number }[];
+  }
+
+  private schedule(): void {
+    if (this.closed) return;
+    clearTimeout(this.timer);
+    const next = this.queued().find((r) => !this.sending.has(r.trace_id));
+    if (!next) return;
+    this.timer = setTimeout(() => this.drain(), Math.max(0, next.next_ms - Date.now()));
+    this.timer.unref();
+  }
+
+  private drain(): void {
+    if (this.closed) return;
+    const now = Date.now();
+    for (const r of this.queued()) {
+      if (r.next_ms > now || this.sending.has(r.trace_id)) continue;
+      this.sending.add(r.trace_id);
+      this.autoForward(r.trace_id, r.attempts)
+        .catch((err) => !this.closed && log.warn(`auto-forward of ${r.trace_id.slice(0, 8)} failed: ${(err as Error).message}`))
+        .finally(() => {
+          this.sending.delete(r.trace_id);
+          this.schedule();
+        });
     }
+    this.schedule();
+  }
+
+  private async autoForward(traceId: string, attempts: number): Promise<void> {
+    const done = () => void this.roots.store.db.prepare("DELETE FROM auto_forwards WHERE trace_id = ?").run(traceId);
+    // Let checks finish so findings travel with the run.
+    if (this.roots.engine) await this.roots.engine.waitIdle(traceId, 120_000);
+    if (this.closed) return;
+    // Deleted, sent by hand meanwhile, or forwarding turned off for the project: nothing to send.
+    const run = this.roots.store.getRun(traceId);
+    if (!run?.project || !projectSettings(this.roots.config, run.project).forward || this.roots.store.forwardedTraceIds().has(traceId)) return done();
+    const out = { retry: false };
+    const row = await this.attempt([traceId], "auto", {}, out);
+    if (this.closed) return;
+    if (row.status === "ok") return done();
+    if (out.retry && attempts + 1 < AUTO_ATTEMPTS) {
+      const delay = Math.min(this.retryBaseMs * 2 ** attempts, AUTO_RETRY_CAP_MS);
+      this.roots.store.db.prepare("UPDATE auto_forwards SET attempts = ?, next_ms = ? WHERE trace_id = ?").run(attempts + 1, Date.now() + delay, traceId);
+      log.warn(`auto-forward of ${traceId.slice(0, 8)} failed: ${row.error}; trying again in ${Math.round(delay / 1000)}s`);
+      return;
+    }
+    log.warn(`auto-forward of ${traceId.slice(0, 8)} failed: ${row.error}`);
+    done();
   }
 
   endpoint(): string {
@@ -185,6 +261,14 @@ export class Relay {
   }
 
   async forward(traceIds: string[], initiatedBy: string, opts: { endpoint?: string; apiKey?: string } = {}): Promise<ForwardRow> {
+    return this.attempt(traceIds, initiatedBy, opts, { retry: false });
+  }
+
+  /**
+   * One forward. `out.retry` says whether a failure may pass on its own (ingest answered 408, 429
+   * or 5xx, or couldn't be reached), so auto-forward tries again later.
+   */
+  private async attempt(traceIds: string[], initiatedBy: string, opts: { endpoint?: string; apiKey?: string }, out: { retry: boolean }): Promise<ForwardRow> {
     const endpoint = trimSlash(opts.endpoint ?? this.endpoint());
     const key = opts.apiKey ?? (await getCloudKey());
     const base = { trace_ids: traceIds, endpoint, initiated_by: initiatedBy };
@@ -227,6 +311,7 @@ export class Relay {
       bytes += a.bytes;
       if (!a.res.ok) {
         const text = isRedirect(a.res) ? redirectError(a.res) : (await a.res.text().catch(() => "")).slice(0, 300);
+        out.retry = a.res.status === 408 || a.res.status === 429 || a.res.status >= 500;
         return this.roots.store.insertForward({ ...base, status: "error", http_status: a.res.status, span_count: enc.spanCount, bytes, redactions: enc.redactions, error: `ingest returned HTTP ${a.res.status}${text ? `: ${text}` : ""}` });
       }
       accepted = a.res.status;
@@ -256,6 +341,8 @@ export class Relay {
       return this.roots.store.insertForward({ ...base, status: "ok", http_status: a.res.status, span_count: enc.spanCount, bytes, redactions: enc.redactions, error: null });
     } catch (err) {
       if (accepted !== null) return sentWithoutMarker((err as Error).message);
+      // A timeout isn't retried: the spans may have landed.
+      out.retry = (err as Error).name !== "TimeoutError";
       return this.roots.store.insertForward({ ...base, status: "error", http_status: null, span_count: enc.spanCount, bytes, redactions: enc.redactions, error: (err as Error).message });
     }
   }

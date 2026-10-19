@@ -34,7 +34,9 @@ The relay is tested end to end by forwarding into a second neatroots instance an
 
 - One run: **Send run to Cloud** in the app, or `neatroots cloud forward <trace-id>`.
 - Every finished run of a project: Settings → Projects → Forward to Cloud, or
-  `neatroots cloud auto <project> on`.
+  `neatroots cloud auto <project> on`. A run that can't be sent because Cloud is unreachable or busy
+  (408, 429, 5xx) is tried again for about half an hour, and runs still waiting when neatroots stops
+  are sent after the next `neatroots start`. Turning forwarding off drops the runs still waiting.
 - From a coding agent: `push_to_cloud` asks; you confirm in the app before anything is sent.
 
 Before each send neatroots shows a redaction preview. Emails, phone numbers, private keys and credentials
