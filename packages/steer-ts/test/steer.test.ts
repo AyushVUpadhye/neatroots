@@ -3,10 +3,11 @@ import type { AddressInfo } from "node:net";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { generateText, wrapLanguageModel } from "ai";
 import { MockLanguageModelV4 } from "ai/test";
-import { applyAnthropic, applyMessages, NeatrootsHalt, rootsMiddleware, checkMyWork, configure, handleToolCall, replayInput, wrapOpenAI, type Note } from "../src/index.js";
+import { applyAnthropic, applyMessages, NeatrootsHalt, rootsMiddleware, checkMyWork, configure, handleToolCall, replayInput, wrapAnthropic, wrapOpenAI, type Note } from "../src/index.js";
 
 const notes: (Note | null)[] = [];
 const claims: any[] = [];
+let mode = "advisory";
 /** Milliseconds to hold the next claim replies (a busy neatroots). */
 const slow: number[] = [];
 let server: http.Server;
@@ -21,7 +22,7 @@ beforeAll(async () => {
       let out: unknown = {};
       if (req.url === "/api/steer/claim") {
         claims.push(b);
-        out = { mode: "advisory", note: notes.shift() ?? null };
+        out = { mode, note: notes.shift() ?? null };
       } else if (req.url === "/api/steer/check") out = { probability: 0.2, answer: "no", evidence_span_ids: ["s1"] };
       setTimeout(() => {
         res.writeHead(200, { "content-type": "application/json" });
@@ -37,6 +38,7 @@ beforeEach(() => {
   configure({ url, traceId: () => "a".repeat(32) });
   notes.length = 0;
   claims.length = 0;
+  mode = "advisory";
   slow.length = 0;
 });
 
@@ -66,6 +68,14 @@ describe("neatroots-steer (ts)", () => {
     expect(seen.messages[0].content).toContain("<neatroots-guidance>");
   });
 
+  it("wraps the client a withOptions copy returns", async () => {
+    notes.push(note("Your rule says stop.", "halt"), note("Your rule says stop.", "halt"));
+    const makeOpenAI = (): any => ({ chat: { completions: { create: async (_p: unknown) => "should not run" } }, withOptions: () => makeOpenAI() });
+    await expect(wrapOpenAI(makeOpenAI()).withOptions().chat.completions.create({ messages: [{ role: "user", content: "q" }] })).rejects.toBeInstanceOf(NeatrootsHalt);
+    const makeAnthropic = (): any => ({ messages: { create: async (_p: unknown) => "should not run" }, withOptions: () => makeAnthropic() });
+    await expect(wrapAnthropic(makeAnthropic()).withOptions().messages.create({ messages: [] })).rejects.toBeInstanceOf(NeatrootsHalt);
+  });
+
   it("applies a replay's input, model and system prompt", async () => {
     expect(replayInput("original")).toBe("original");
     process.env.NEATROOTS_REPLAY_INPUT = "edited";
@@ -89,6 +99,13 @@ describe("neatroots-steer (ts)", () => {
     notes.push(note("Your rule says stop.", "halt"));
     const client = wrapOpenAI({ chat: { completions: { create: async (_p: unknown) => "should not run" } } });
     await expect(client.chat.completions.create({ messages: [{ role: "user", content: "q" }] })).rejects.toBeInstanceOf(NeatrootsHalt);
+  });
+
+  it("ignores a note, a halt included, that arrives with steering off", async () => {
+    mode = "off";
+    notes.push(note("Your rule says stop.", "halt"));
+    const client = wrapOpenAI({ chat: { completions: { create: async (_p: unknown) => "ran" } } });
+    await expect(client.chat.completions.create({ messages: [{ role: "user", content: "q" }] })).resolves.toBe("ran");
   });
 
   it("works as AI SDK 7 middleware", async () => {

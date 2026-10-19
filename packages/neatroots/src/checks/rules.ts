@@ -1,6 +1,16 @@
 import type { RuleCheck } from "./types.js";
 import { finalOutput, selectSpans, type SpanInfo, type TraceSnapshot } from "../engine/trace.js";
 import { preview } from "../semantics/view.js";
+import { log } from "../util/log.js";
+import { testWithin } from "../util/regex.js";
+
+/** How long one check's pattern may run on one span before it is treated as too slow. */
+const MATCH_MS = 50;
+/** Patterns that ran out of time; skipped from then on, so a bad check costs one short stall. */
+const tooSlow = new Set<string>();
+/** Results for patterns run under the time limit, per span, so a span is tested once per pattern. */
+const matchMemo = new Map<string, boolean>();
+const TIMED_OUT = Symbol("timed out");
 
 export interface RuleHit {
   /** Whether the condition holds now, looking at the latest spans. */
@@ -33,13 +43,31 @@ function keyOf(s: SpanInfo, fields: string[]): string {
 }
 
 /** Words an agent uses when it tells the user something went wrong. */
-const ADMITS_FAILURE = /\b(fail(ed|s|ure|ing)?|errors?|unable|couldn'?t|could not|can'?t|cannot|unfortunately|sorry|apologi[sz]e|didn'?t (go through|work|succeed)|not (able|successful|completed)|try again|retry)\b/i;
+const ADMITS_FAILURE = /\b(fail(ed|s|ures?|ing)?|errors?|unable|couldn'?t|could not|can'?t|can ?not|unfortunately|sorry|apologi[sz]e|(didn'?t|did not|doesn'?t|does not|won'?t|will not) (go through|work|succeed)|(not|wasn'?t|weren'?t) (able|successful|completed)|try again|retry)\b/i;
 
-/** "No errors", "without any failures", "no need to try again": the answer says nothing failed. */
-const DENIES_FAILURE = /\b(?:no|zero|without(?: any)?|free of)\s+(?:\w+\s+)?(?:errors?|fail(?:ures?|ed)?|issues?|problems?)\b|\bno need to (?:try again|retry)\b/gi;
+/** Curly, modifier, backtick, and fullwidth apostrophes, as models often write "couldn’t". */
+const APOSTROPHES = /[\u2018\u2019\u02BC\u0060\uFF07]/g;
+
+/** "No errors", "0 failures", "weren't any failures", "no need to try again": the answer says nothing failed. */
+const DENIES_FAILURE = /\b(?:no|zero|0|without(?: any)?|free of|(?:weren'?t|wasn'?t|were not|was not|never(?:\s+\w+)?)\s+any)\s+(?:\w+\s+)?(?:errors?|fail(?:ures?|ed)?|issues?|problems?)\b|\bno need to (?:try again|retry)\b/gi;
 
 function clip(s: string, n = 120): string {
   return s.length > n ? s.slice(0, n - 1) + "…" : s;
+}
+
+/** Retries stay within the nearest agent; ordinary per-turn spans fall back to the run root. */
+function recoveryScope(span: SpanInfo, byId: Map<string, SpanInfo>, rootId: string): string {
+  const seen = new Set([span.id]);
+  let parentId = span.parentId;
+  while (parentId) {
+    if (seen.has(parentId)) break;
+    seen.add(parentId);
+    const parent = byId.get(parentId);
+    if (!parent) break;
+    if (parent.kind === "AGENT") return parent.id;
+    parentId = parent.parentId;
+  }
+  return rootId;
 }
 
 /** How much of a field a `match` rule reads, across all the texts it reads from it. */
@@ -78,7 +106,7 @@ function matchTexts(v: unknown): string[] {
  * a finding later resolves. `fresh` names the spans that just arrived: a streak they complete
  * fires even if a later span in the same batch already ended it.
  */
-export function evaluateRule(check: RuleCheck, t: TraceSnapshot, atEnd: boolean, fresh?: ReadonlySet<string>): RuleHit | null {
+export function evaluateRule(check: RuleCheck, t: TraceSnapshot, atEnd: boolean, fresh?: ReadonlySet<string>, untrusted = false): RuleHit | null {
   const r = check.rule;
   switch (r.type) {
     case "repeat": {
@@ -174,20 +202,44 @@ export function evaluateRule(check: RuleCheck, t: TraceSnapshot, atEnd: boolean,
       return { firing: true, evidenceSpanIds: [], params: { value: String(Math.round(value)), metric: r.metric } };
     }
     case "match": {
+      const key = `${r.flags ?? "i"}/${r.pattern}`;
+      if (untrusted && tooSlow.has(key)) return null;
       let re: RegExp;
       try {
         re = new RegExp(r.pattern, r.flags ?? "i");
       } catch {
         return null;
       }
-      const hits = selectSpans(t.spans, r.span).filter((s) => {
-        const v = r.field === "input" ? s.input : r.field === "output" ? s.output : r.field === "error" ? s.error : s.name;
-        if (v === undefined || v === null) return false;
-        return matchTexts(v).some((text) => {
-          re.lastIndex = 0;
-          return re.test(text);
+      // Library patterns are known to be fast. Patterns from checks people (or coding agents) write
+      // run under a time limit, since a regex can backtrack for minutes and stall the server.
+      const test = (text: string): boolean => {
+        re.lastIndex = 0;
+        if (!untrusted) return re.test(text);
+        const ok = testWithin(re, text, MATCH_MS);
+        if (ok === undefined) throw TIMED_OUT;
+        return ok;
+      };
+      let hits: SpanInfo[];
+      try {
+        hits = selectSpans(t.spans, r.span).filter((s) => {
+          const v = r.field === "input" ? s.input : r.field === "output" ? s.output : r.field === "error" ? s.error : s.name;
+          if (v === undefined || v === null) return false;
+          const texts = matchTexts(v);
+          if (!untrusted) return texts.some(test);
+          const memo = `${key}\u0000${t.run?.trace_id ?? ""}\u0000${s.id}\u0000${r.field}\u0000${texts.reduce((n, x) => n + x.length, 0)}`;
+          const known = matchMemo.get(memo);
+          if (known !== undefined) return known;
+          const found = texts.some(test);
+          if (matchMemo.size >= 50_000) matchMemo.clear();
+          matchMemo.set(memo, found);
+          return found;
         });
-      });
+      } catch (e) {
+        if (e !== TIMED_OUT) throw e;
+        tooSlow.add(key);
+        log.warn(`check ${check.id}: its pattern took over ${MATCH_MS} ms on one span, so it is skipped until neatroots restarts. Simplify the regex (overlapping alternatives in a repeat, like (a|aa)+, are slow).`);
+        return null;
+      }
       if (!hits.length) return null;
       return { firing: true, evidenceSpanIds: hits.map((s) => s.id), params: { count: String(hits.length), span: hits[0].ref } };
     }
@@ -197,7 +249,9 @@ export function evaluateRule(check: RuleCheck, t: TraceSnapshot, atEnd: boolean,
       // Instrumented spans that succeed usually report status unset, so only errors are ruled out.
       const needed = selectSpans(t.spans, { ...r.requires, status: "any" }).filter((s) => s.status !== "error");
       const missed = guarded.filter((g) => !needed.some((n) => n.id !== g.id && n.startMs <= g.startMs));
-      if (!missed.length) return null;
+      // Spans can arrive out of order: once a late prerequisite covers every call, say so,
+      // so a finding raised before it arrived resolves.
+      if (!missed.length) return { firing: false, evidenceSpanIds: guarded.map((s) => s.id), params: {} };
       const first = missed[0];
       return {
         firing: true,
@@ -217,11 +271,14 @@ export function evaluateRule(check: RuleCheck, t: TraceSnapshot, atEnd: boolean,
       const out = finalOutput(t);
       if (!out || /^("?\s*"?|null|\{\}|\[\])$/.test(out.trim())) return null;
       // An answer that says something failed is the agent being honest, not a problem.
-      if (ADMITS_FAILURE.test(out.replace(DENIES_FAILURE, " "))) return null;
+      if (ADMITS_FAILURE.test(out.replace(APOSTROPHES, "'").replace(DENIES_FAILURE, " "))) return null;
       const spans = selectSpans(t.spans, r.span ?? { type: ["tool", "mcp_tool"] }).sort((a, b) => a.endMs - b.endMs || a.seq - b.seq);
-      // The last call of each tool decides it: a later success means the agent recovered.
+      // Per-turn spans often change between retries. Scope by the nearest agent-kind ancestor,
+      // falling back to the root for traces without one; malformed parent links also fall back safely.
+      const byId = new Map(t.spans.map((s) => [s.id, s]));
+      const rootId = t.spans.find((s) => s.parentId === null)?.id ?? t.traceId;
       const last = new Map<string, SpanInfo>();
-      for (const s of spans) last.set(s.toolName ?? s.name, s);
+      for (const s of spans) last.set(JSON.stringify([recoveryScope(s, byId, rootId), s.toolName ?? s.name]), s);
       const failed = [...last.values()].filter((s) => s.status === "error");
       if (!failed.length) return null;
       const first = failed[0];
@@ -256,22 +313,29 @@ export function evaluateRule(check: RuleCheck, t: TraceSnapshot, atEnd: boolean,
       const spans = selectSpans(t.spans, r.span).sort((a, b) => a.endMs - b.endMs);
       const names = spans.map((s) => s.toolName ?? s.name);
       const outs = spans.map((s) => jsonKey(s.output));
-      // Longest tail of the call list that is one short pattern repeated with no new results.
+      // Stretches of the call list that are one short pattern repeated with no new results, found
+      // in one pass per period. One still holds if it reaches the newest call or a fresh span
+      // completed it; otherwise the newest stretch is reported as one the agent broke out of.
+      let best: { start: number; end: number; p: number; firing: boolean } | undefined;
       for (let p = 2; p <= r.max_period; p++) {
-        let n = spans.length;
-        while (n - p >= 0 && names[n - 1] === names[n - 1 - p] && outs[n - 1] === outs[n - 1 - p]) n--;
-        const start = n - p;
-        const len = spans.length - start;
-        if (start < 0 || len < p * r.min_cycles) continue;
-        const pattern = names.slice(start, start + p);
-        if (new Set(pattern).size < 2) continue;
-        return {
-          firing: true,
-          evidenceSpanIds: spans.slice(start).map((s) => s.id),
-          params: { pattern: pattern.join(" -> "), count: String(Math.floor(len / p)) },
-        };
+        let start = 0;
+        for (let end = p; end <= spans.length; end++) {
+          if (end < spans.length && names[end] === names[end - p] && outs[end] === outs[end - p]) continue;
+          // spans[start, end) repeat with period p; the next stretch can begin p - 1 calls back.
+          const from = start;
+          start = end - p + 1;
+          if (end - from < p * r.min_cycles || new Set(names.slice(from, from + p)).size < 2) continue;
+          const firing = end === spans.length || (!!fresh && spans.slice(from + p * r.min_cycles - 1, end).some((s) => fresh.has(s.id)));
+          if (!best || (firing && !best.firing) || (firing === best.firing && end > best.end)) best = { start: from, end, p, firing };
+        }
       }
-      return null;
+      if (!best) return null;
+      const { start, end, p } = best;
+      return {
+        firing: best.firing,
+        evidenceSpanIds: spans.slice(start, end).map((s) => s.id),
+        params: { pattern: names.slice(start, start + p).join(" -> "), count: String(Math.floor((end - start) / p)) },
+      };
     }
     case "run_end": {
       if (!atEnd || !t.run) return null;

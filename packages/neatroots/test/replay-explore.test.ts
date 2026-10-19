@@ -1,3 +1,4 @@
+import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { loadTrace } from "../src/engine/trace.js";
 import { EXPLORE_TOOLS } from "../src/mcp/explore-tools.js";
@@ -5,7 +6,7 @@ import { toChat } from "../src/replay/replay.js";
 import { Replays } from "../src/replay/replay.js";
 import { buildChat } from "../src/semantics/chat-view.js";
 import { parseSearch } from "../src/server/api-explore.js";
-import { batch, hex, llmSpan, makeRoots, mockLlm, s, span, toolSpan, until, type TestRoots } from "./helpers.js";
+import { batch, hex, llmSpan, makeRoots, mockLlm, s, span, tmpHome, toolSpan, until, type TestRoots } from "./helpers.js";
 
 let t: TestRoots | undefined;
 let llm: Awaited<ReturnType<typeof mockLlm>> | undefined;
@@ -82,6 +83,32 @@ describe("replay", () => {
     expect(run.output_preview).toContain("model=small-model");
     expect(() => t!.roots.replays.startRun(hex(16))).toThrow(/run not found/);
   }, 30_000);
+
+  it("fails the replay, not the server, when the rerun folder is gone", async () => {
+    t = await makeRoots({ noEngine: true });
+    const x = seed(t);
+    // Registered while the folder existed, then the folder was deleted (a removed worktree, say).
+    const gone = path.join(tmpHome(), "deleted-agent-dir");
+    t.roots.config.rerun["support-agent"] = { command: "node -e 0", cwd: gone };
+    const { done } = t.roots.replays.startRun(x.traceId);
+    const r = await done;
+    expect(r.state).toBe("failed");
+    expect(r.error).toMatch(/rerun folder .*deleted-agent-dir doesn't exist/);
+    expect(t.roots.replays.get(r.id)?.state).toBe("failed");
+  });
+
+  it("refuses to register a rerun command in a folder that doesn't exist", async () => {
+    t = await makeRoots({ noEngine: true, serve: true });
+    const post = (cwd: string) =>
+      fetch(`${t!.url}/api/projects/support-agent/rerun`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ command: "node agent.js", cwd }) });
+    const bad = await post(path.join(tmpHome(), "missing"));
+    expect(bad.status).toBe(400);
+    expect((await bad.json()).error).toMatch(/no such folder/);
+    expect(t.roots.config.rerun["support-agent"]).toBeUndefined();
+    const dir = tmpHome();
+    expect((await post(dir)).status).toBe(200);
+    expect(t.roots.config.rerun["support-agent"]).toMatchObject({ command: "node agent.js", cwd: dir });
+  });
 
   it("marks replays left running as failed on restart", async () => {
     t = await makeRoots({ noEngine: true });

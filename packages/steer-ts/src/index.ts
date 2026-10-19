@@ -244,7 +244,8 @@ export async function guidance(traceId?: string): Promise<Note | undefined> {
   state.mode = res.mode || "unknown";
   state.modeCheckedAt = Date.now();
   state.modeTraceId = traceId;
-  if (!res.note) return undefined;
+  // A note that arrives with steering off (an older neatroots) is not used.
+  if (!res.note || state.mode === "off") return undefined;
   await record(res.note);
   if (res.note.kind === "halt") throw new NeatrootsHalt(res.note.text);
   return res.note;
@@ -352,7 +353,19 @@ function wrapMethod(
   owner[name] = wrapped;
 }
 
-/** Adds neatroots guidance to an OpenAI client (chat.completions.create and responses.create), in place. */
+/** Wraps a method that builds a new client (`withOptions`) so the copy is wrapped too. */
+function wrapFactory(owner: Record<string, unknown> | undefined, name: string, wrap: (next: object) => unknown): void {
+  if (!owner) return;
+  const original = owner[name] as ((...a: unknown[]) => unknown) & { __neatroots?: boolean };
+  if (typeof original !== "function" || original.__neatroots) return;
+  const wrapped = function (this: unknown, ...args: unknown[]) {
+    return wrap(original.apply(owner, args) as object);
+  } as typeof original;
+  wrapped.__neatroots = true;
+  owner[name] = wrapped;
+}
+
+/** Adds neatroots guidance to an OpenAI client (chat.completions.create/parse, responses.create/parse and withOptions), in place. */
 export function wrapOpenAI<T extends object>(client: T): T {
   const c = client as unknown as { chat?: { completions?: Record<string, unknown> }; responses?: Record<string, unknown> };
   wrapMethod(c.chat?.completions, "create", (p, note) => {
@@ -367,10 +380,11 @@ export function wrapOpenAI<T extends object>(client: T): T {
     if (Array.isArray(input)) return { ...p, input: [...input, { role: "user", content: guidanceBlock(note) }] };
     return p;
   }, overrideResponses);
+  wrapFactory(client as unknown as Record<string, unknown>, "withOptions", (next) => wrapOpenAI(next));
   return client;
 }
 
-/** Adds neatroots guidance to an Anthropic client (messages.create), in place. */
+/** Adds neatroots guidance to an Anthropic client (messages.create and withOptions), in place. */
 export function wrapAnthropic<T extends object>(client: T): T {
   const c = client as unknown as { messages?: Record<string, unknown> };
   wrapMethod(c.messages, "create", (p, note) => {
@@ -379,6 +393,7 @@ export function wrapAnthropic<T extends object>(client: T): T {
     const next = last?.role === "user" ? [...msgs.slice(0, -1), appendText(last, guidanceBlock(note))] : [...msgs, { role: "user", content: [{ type: "text", text: guidanceBlock(note) }] }];
     return { ...p, messages: next };
   }, overrideAnthropic);
+  wrapFactory(client as unknown as Record<string, unknown>, "withOptions", (next) => wrapAnthropic(next));
   return client;
 }
 

@@ -1,6 +1,7 @@
 interface ResponseRequest {
   asResponse(): Promise<Response>;
   withResponse(): Promise<unknown>;
+  _thenUnwrap<T>(transform: (data: unknown, props: unknown) => T): unknown;
 }
 
 /** Wait for guidance without assimilating the SDK promise or consuming its response body. */
@@ -28,6 +29,12 @@ export class SteeredRequest extends Promise<unknown> {
 
   override finally(settled?: (() => void) | null): Promise<unknown> {
     return this.parse().finally(settled);
+  }
+
+  _thenUnwrap<T>(transform: (data: unknown, props: unknown) => T): SteeredRequest {
+    return new SteeredRequest(this.request.then(({ value }) => ({
+      value: (value as ResponseRequest)._thenUnwrap(transform),
+    })));
   }
 
   asResponse(): Promise<Response> {
