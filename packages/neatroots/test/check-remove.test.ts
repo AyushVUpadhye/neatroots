@@ -177,3 +177,55 @@ it("removes every copy of the id in the file, so an earlier duplicate doesn't co
   expect(r.get("dup")).toBeUndefined();
   expect(read("dupes.yaml")).toBe("- id: other\n  kind: rule\n  rule: {type: count, span: {type: tool}, at_least: 2}\n");
 });
+
+const rule = (id: string, n: number, indent = "  ") => `${indent}- id: ${id}\n${indent}  kind: rule\n${indent}  rule: {type: count, span: {type: tool}, at_least: ${n}}\n`;
+
+it("deletes a file whose only check sat in a checks: list, instead of leaving checks: with no value", () => {
+  write("wrapped.yaml", `# team checks\nchecks:\n${rule("b", 2)}`);
+  const r = registry();
+  expect(r.remove("b")).toBe(true);
+  expect(fs.existsSync(path.join(checks, "wrapped.yaml"))).toBe(false);
+  expect(r.errors).toEqual([]);
+});
+
+it("keeps a valid checks: [] when the file has more than the list, and the last check in it goes", () => {
+  write("wrapped.yaml", `version: 2\nchecks:\n${rule("a", 1)}${rule("b", 2)}`);
+  const r = registry();
+  r.remove("a");
+  expect(read("wrapped.yaml")).toBe(`version: 2\nchecks:\n${rule("b", 2)}`);
+  r.remove("b");
+  expect(read("wrapped.yaml")).toBe("version: 2\nchecks:\n  []\n");
+  const left = parseChecks(read("wrapped.yaml"));
+  expect(left).toEqual({ checks: [], errors: [] });
+  expect(r.errors).toEqual([]);
+});
+
+it("takes a comment on the check's own - line with it, so the next check still loads", () => {
+  const a = rule("a", 1, "");
+  write("commented.yaml", `- # the b check\n  id: b\n  kind: rule\n  rule: {type: count, span: {type: tool}, at_least: 2}\n${a}`);
+  const r = registry();
+  expect(r.remove("b")).toBe(true);
+  expect(read("commented.yaml")).toBe(a);
+  expect(r.get("a")).toBeDefined();
+  expect(r.errors).toEqual([]);
+});
+
+it("refuses a delete that would change what the rest of the file loads, and leaves the file as it is", async () => {
+  // A comment line between the dash and the check's first key: cutting the check would leave a
+  // bare "-" (a null entry) in front of the next check.
+  const text = `-\n  # the b check\n  id: b\n  kind: rule\n  rule: {type: count, span: {type: tool}, at_least: 2}\n${rule("a", 1, "")}`;
+  write("odd.yaml", text);
+  const r = registry();
+  expect(() => r.remove("b")).toThrow(/without changing other checks/);
+  expect(read("odd.yaml")).toBe(text);
+  expect(r.get("b")).toBeDefined();
+  expect(r.get("a")).toBeDefined();
+  const t = await makeRoots({ serve: true, noEngine: true, config: (c) => (c.checkDirs = [checks]) });
+  try {
+    const res = await fetch(`${t.url}/api/checks/b`, { method: "DELETE" });
+    expect(res.status).toBe(409);
+    expect(read("odd.yaml")).toBe(text);
+  } finally {
+    await t.close();
+  }
+});

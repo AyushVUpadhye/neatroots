@@ -96,7 +96,8 @@ export function mountChecksApi(app: Hono, roots: Roots): void {
     try {
       removed = roots.checks.remove(c.req.param("id"));
     } catch (e) {
-      // The file can't lose this check without breaking another one (a shared YAML anchor).
+      // The file can't lose this check without changing another one (a shared YAML anchor, or a
+      // cut that would alter what the rest of the file loads); it is left as it is.
       return err(c, 409, (e as Error).message);
     }
     return removed ? c.json({ ok: true }) : err(c, 400, "only user, project or planner checks can be deleted; disable library checks instead");

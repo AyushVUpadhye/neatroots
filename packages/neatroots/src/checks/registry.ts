@@ -149,15 +149,38 @@ function textOf(text: string, { doc, node, list }: FoundCheck): [number, number]
     const before = /,\s*$/.exec(text.slice(0, start));
     return [before ? before.index : start, end];
   }
-  // A block entry runs from the start of its "- " line to the end of its last line.
-  const marker = /(^|\n)[ \t]*-\s+$/.exec(text.slice(0, start));
+  // A block entry runs from the start of its "- " line (which may carry a comment) to the end of its last line.
+  const marker = /(^|\n)[ \t]*-[ \t]*(#[^\n]*)?\s+$/.exec(text.slice(0, start));
   return [marker ? marker.index + marker[1].length : start, end];
+}
+
+/** The checks and load errors a file yields, other than this id's, comparable before and after an edit. */
+function otherContent(text: string, id: string): string {
+  const { checks, errors } = parseChecks(text);
+  return JSON.stringify({
+    checks: checks.filter((c) => c.id !== id),
+    // Line and column numbers move when text above them is cut.
+    errors: errors.filter((e) => e.id !== id).map((e) => `${e.id ?? ""}|${e.message.replace(/\d+/g, "#")}`),
+  });
+}
+
+/** True when a checks file holds nothing but comments, empty lists and empty `checks:` wrappers. */
+function holdsNothing(text: string): boolean {
+  return YAML.parseAllDocuments(text).every((doc) => {
+    if (doc.errors.length) return false;
+    const c = doc.contents;
+    if (c === null || (YAML.isScalar(c) && c.value === null)) return true;
+    if (YAML.isSeq(c)) return c.items.length === 0;
+    const wrapped = YAML.isMap(c) && c.items.length === 1 ? c.get("checks", true) : undefined;
+    return YAML.isSeq(wrapped) && wrapped.items.length === 0;
+  });
 }
 
 /**
  * Cuts every check with this id out of a checks file; all other text stays exactly as written:
  * comments, other checks (including ones that don't validate yet) and other documents. Throws when
- * another check uses a YAML anchor the removed one defines, since that check would stop loading.
+ * another check uses a YAML anchor the removed one defines, since that check would stop loading,
+ * and when the cut would change anything else the file yields.
  */
 function removeFromYaml(text: string, id: string): string {
   const found = findChecks(text, id);
@@ -176,8 +199,29 @@ function removeFromYaml(text: string, id: string): string {
       },
     });
   }
+  const cuts: { start: number; end: number; with: string }[] = [];
+  for (const f of found) {
+    const [start, end] = textOf(text, f);
+    const list = f.list;
+    // Emptying a block `checks:` list would leave `checks:` with no value, which doesn't load; it
+    // becomes `checks: []` instead (at the first entry's dash, so its indentation stays valid).
+    if (list && !list.flow && list !== f.doc.contents && list.items.every((n) => found.some((g) => g.node === n))) {
+      if (f.node !== list.items[0]) {
+        cuts.push({ start, end, with: "" });
+        continue;
+      }
+      const dash = start + /^[ \t]*/.exec(text.slice(start))![0].length;
+      const eol = text.includes("\r\n") ? "\r\n" : "\n";
+      cuts.push({ start: dash, end, with: `[]${eol}` });
+      continue;
+    }
+    cuts.push({ start, end, with: "" });
+  }
   let out = text;
-  for (const [start, end] of found.map((f) => textOf(text, f)).reverse()) out = out.slice(0, start) + out.slice(end);
+  for (const c of cuts.sort((a, b) => b.start - a.start)) out = out.slice(0, c.start) + c.with + out.slice(c.end);
+  if (otherContent(out, id) !== otherContent(text, id) || parseChecks(out).checks.some((c) => c.id === id)) {
+    throw new Error(`can't delete check ${id} without changing other checks in its file, so the file was left as it is. Remove it from the file by hand.`);
+  }
   return out;
 }
 
@@ -348,10 +392,9 @@ export class CheckRegistry {
     if (lc.path && fs.existsSync(lc.path)) {
       const before = fs.readFileSync(lc.path, "utf8");
       const text = removeFromYaml(before, id);
-      const left = parseChecks(text);
       if (text === before) {
         /* edited by hand since it was loaded; nothing of this check left to remove */
-      } else if (!left.checks.length && !left.errors.length) fs.unlinkSync(lc.path);
+      } else if (holdsNothing(text)) fs.unlinkSync(lc.path);
       else fs.writeFileSync(lc.path, text, "utf8");
     }
     this.store.db.prepare("DELETE FROM checks WHERE id = ?").run(id);
