@@ -494,14 +494,23 @@ export function mountApi(app: Hono, roots: Roots): void {
   app.post("/api/pushes/:id/:action", async (c) => {
     const p = roots.pushes.get(c.req.param("id"));
     if (!p) return err(c, 404, "push not found");
+    // Every open tab shows the push, so a second answer can come while (or after) it is sent.
     if (p.status !== "pending") return c.json(p);
     if (c.req.param("action") === "decline") {
       p.status = "declined";
     } else if (c.req.param("action") === "confirm") {
-      const row = await roots.relay.forward(p.trace_ids, "coding-agent (confirmed)");
-      p.status = row.status === "ok" ? "sent" : "failed";
-      p.forward_id = row.id;
-      p.error = row.error ?? undefined;
+      // Set before the send starts: another confirm can't send the runs again, nor a decline say nothing was sent.
+      p.status = "sending";
+      roots.bus.emit("activity", { kind: "push", message: p.status });
+      try {
+        const row = await roots.relay.forward(p.trace_ids, "coding-agent (confirmed)");
+        p.status = row.status === "ok" ? "sent" : "failed";
+        p.forward_id = row.id;
+        p.error = row.error ?? undefined;
+      } catch (e) {
+        p.status = "failed";
+        p.error = (e as Error).message;
+      }
     } else return err(c, 400, "action must be confirm or decline");
     roots.bus.emit("activity", { kind: "push", message: p.status });
     return c.json(p);

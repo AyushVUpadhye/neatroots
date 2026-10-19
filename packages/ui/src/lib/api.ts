@@ -403,7 +403,7 @@ export interface Push {
   trace_ids: string[];
   requested_by: string;
   created_ms: number;
-  status: "pending" | "sent" | "failed" | "declined";
+  status: "pending" | "sending" | "sent" | "failed" | "declined";
   error?: string;
 }
 
