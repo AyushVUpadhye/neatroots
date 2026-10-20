@@ -222,11 +222,20 @@ export function evaluateRule(check: RuleCheck, t: TraceSnapshot, atEnd: boolean,
       let hits: SpanInfo[];
       try {
         hits = selectSpans(t.spans, r.span).filter((s) => {
-          const v = r.field === "input" ? s.input : r.field === "output" ? s.output : r.field === "error" ? s.error : s.name;
+          const v =
+            r.field === "input"
+              ? s.input
+              : r.field === "output"
+                ? s.output
+                : r.field === "error"
+                  ? s.error
+                  : r.field === "finish_reason"
+                    ? s.finishReason
+                    : s.name;
           if (v === undefined || v === null) return false;
           const texts = matchTexts(v);
           if (!untrusted) return texts.some(test);
-          const memo = `${key}\u0000${t.run?.trace_id ?? ""}\u0000${s.id}\u0000${r.field}\u0000${texts.reduce((n, x) => n + x.length, 0)}`;
+          const memo = `${key}\u0000${t.run?.trace_id ?? ""}\u0000${s.id}\u0000${r.field}\u0000${texts.reduce((n, x) => n + x.length, 0)}\u0000${r.field === "finish_reason" ? jsonKey(v) : ""}`;
           const known = matchMemo.get(memo);
           if (known !== undefined) return known;
           const found = texts.some(test);

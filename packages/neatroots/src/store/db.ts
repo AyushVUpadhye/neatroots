@@ -68,6 +68,8 @@ CREATE TABLE IF NOT EXISTS runs (
   updated_ms INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS runs_started ON runs (started_ms DESC);
+-- The run list and Insights sort and filter by this expression; an index on started_ms alone can't serve them.
+CREATE INDEX IF NOT EXISTS runs_sort ON runs (COALESCE(started_ms, received_ms) DESC);
 CREATE INDEX IF NOT EXISTS runs_session ON runs (session_id);
 CREATE INDEX IF NOT EXISTS runs_workflow ON runs (workflow);
 CREATE INDEX IF NOT EXISTS runs_project ON runs (project);
@@ -473,6 +475,12 @@ export class Store {
     return json<OtlpResource>(r?.json, { attributes: [] });
   }
 
+  /** The resources a run's spans were sent with (one per sender, usually one). */
+  resourcesFor(traceId: string): OtlpResource[] {
+    const rows = this.db.prepare("SELECT DISTINCT resource_id FROM spans WHERE trace_id = ?").all(traceId) as { resource_id: string }[];
+    return rows.map((r) => this.getResource(r.resource_id));
+  }
+
   getScope(id: string): OtlpScope {
     const r = this.db.prepare("SELECT json FROM scopes WHERE id = ?").get(id) as { json: string } | undefined;
     return json<OtlpScope>(r?.json, { name: "" });
@@ -751,7 +759,9 @@ export class Store {
       where.push("session_id = @session");
       p.session = f.sessionId;
     }
-    if (f.hasFinding) where.push("finding_count > 0");
+    if (f.hasFinding !== undefined) {
+      where.push(f.hasFinding ? "finding_count > 0" : "finding_count = 0");
+    }
     if (f.hasOpenFinding) where.push("open_finding_count > 0");
     if (f.checkId) {
       where.push("trace_id IN (SELECT trace_id FROM findings WHERE check_id = @check AND status NOT IN ('dismissed', 'failed', 'quiet'))");

@@ -156,6 +156,8 @@ function endGroup(p: ChildProcess): void {
 export class AgentChats {
   private readonly running = new Map<string, ChildProcess>();
   private readonly stopping = new Set<string>();
+  /** Set when neatroots stops: a killed agent's late output is ignored (the store is closed). */
+  private closed = false;
 
   constructor(private readonly roots: Roots) {
     roots.store.db.exec(SCHEMA);
@@ -248,6 +250,26 @@ export class AgentChats {
   }
 
   /**
+   * Ends every agent still answering, and what it started, when neatroots stops (Ctrl-C, the
+   * service stopping, the terminal closing). neatroots exits right after, so endGroup's timer would
+   * never fire: give them a moment to exit on SIGTERM, then SIGKILL whatever is left.
+   */
+  close(): void {
+    this.closed = true;
+    const groups = [...this.running.values()];
+    this.running.clear();
+    if (process.platform === "win32") {
+      // No process groups on Windows: end each agent's whole process tree instead.
+      for (const p of groups) if (p.pid) spawnSync("taskkill", ["/pid", String(p.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
+      return;
+    }
+    for (const p of groups) signalGroup(p, "SIGTERM");
+    const nap = new Int32Array(new SharedArrayBuffer(4));
+    for (let waited = 0; waited < 1000 && groups.some(groupAlive); waited += 50) Atomics.wait(nap, 0, 0, 50);
+    for (const p of groups) if (groupAlive(p)) signalGroup(p, "SIGKILL");
+  }
+
+  /**
    * The turn is over (the agent process closed). Its result event arrives a moment earlier, so an
    * open chat that refetched on the result can still have read "running"; this tells it to look again.
    */
@@ -286,7 +308,7 @@ export class AgentChats {
     let stderr = "";
     let sawResult = false;
     child.stdout!.on("data", (b: Buffer) => {
-      if (!this.get(id)) return;
+      if (this.closed || !this.get(id)) return;
       buf += b.toString();
       let nl: number;
       while ((nl = buf.indexOf("\n")) >= 0) {
@@ -309,6 +331,7 @@ export class AgentChats {
       const finish = (code: number | null, signal: NodeJS.Signals | null) => {
         if (done) return;
         done = true;
+        if (this.closed) return resolve();
         this.running.delete(id);
         // The turn is over: anything the CLI started and left running goes with it.
         endGroup(child);
@@ -325,6 +348,7 @@ export class AgentChats {
       child.on("error", (err) => {
         if (done) return;
         done = true;
+        if (this.closed) return resolve();
         this.running.delete(id);
         this.stopping.delete(id);
         this.emit(id, { kind: "error", text: err.message });
