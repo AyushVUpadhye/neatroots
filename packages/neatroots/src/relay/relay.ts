@@ -67,7 +67,8 @@ export class Relay {
   /** First delay before a failed send is tried again. */
   retryBaseMs = AUTO_RETRY_MS;
   private timer?: NodeJS.Timeout;
-  private sending = new Set<string>();
+  /** Runs this neatroots is auto-forwarding, each with the send under way (a send by hand waits for it). */
+  private sending = new Map<string, Promise<void>>();
   /** Runs being sent outside the queue (by hand, a confirmed push), with how many such sends are under way. */
   private sendingOutside = new Map<string, number>();
   private closed = false;
@@ -122,7 +123,7 @@ export class Relay {
     // only delays that run until its lease runs out.
     try {
       const release = this.roots.store.db.prepare("UPDATE auto_forwards SET claimed_until = NULL WHERE trace_id = ?");
-      for (const id of this.sending) release.run(id);
+      for (const id of this.sending.keys()) release.run(id);
     } catch (err) {
       log.warn(`couldn't release auto-forward claims: ${(err as Error).message}`);
     }
@@ -130,7 +131,7 @@ export class Relay {
 
   /** The runs this neatroots is sending, as a JSON array for json_each, so the queue is read in SQL rather than loaded. */
   private notSending(): string {
-    return JSON.stringify([...this.sending]);
+    return JSON.stringify([...this.sending.keys()]);
   }
 
   private schedule(): void {
@@ -158,13 +159,15 @@ export class Relay {
       if (this.sending.size >= AUTO_CONCURRENCY) break;
       // Taken in one statement, so two neatroots on the same store never both send a run.
       if (claim.run(now + AUTO_LEASE_MS, r.trace_id, now).changes !== 1) continue;
-      this.sending.add(r.trace_id);
-      this.autoForward(r.trace_id, r.attempts)
-        .catch((err) => !this.closed && log.warn(`auto-forward of ${r.trace_id.slice(0, 8)} failed: ${(err as Error).message}`))
-        .finally(() => {
-          this.sending.delete(r.trace_id);
-          this.schedule();
-        });
+      this.sending.set(
+        r.trace_id,
+        this.autoForward(r.trace_id, r.attempts)
+          .catch((err) => void (!this.closed && log.warn(`auto-forward of ${r.trace_id.slice(0, 8)} failed: ${(err as Error).message}`)))
+          .finally(() => {
+            this.sending.delete(r.trace_id);
+            this.schedule();
+          }),
+      );
     }
     this.schedule();
   }
@@ -330,12 +333,27 @@ export class Relay {
   }
 
   async forward(traceIds: string[], initiatedBy: string, opts: { endpoint?: string; apiKey?: string } = {}): Promise<ForwardRow> {
+    // An auto-forward of one of these runs is under way: a run counts as sent only once Cloud
+    // answers it, so wait for that answer instead of sending the run a second time meanwhile.
+    const waited = new Set<string>();
+    for (let busy = traceIds.filter((id) => this.sending.has(id)); busy.length; busy = traceIds.filter((id) => this.sending.has(id))) {
+      for (const id of busy) waited.add(id);
+      await Promise.all(busy.map((id) => this.sending.get(id)));
+    }
+    // From here to attempt()'s marking below nothing is awaited, so no auto-forward can start in between.
+    const justSent = traceIds.filter((id) => waited.has(id) && this.roots.store.wasForwarded(id));
+    const rest = traceIds.filter((id) => !justSent.includes(id));
+    if (!rest.length) {
+      const row = this.roots.store.lastForwardOf(traceIds[0]);
+      if (row) return row;
+    }
+    const send = rest.length ? rest : traceIds;
     // A queued auto-forward of these runs waits until this send has its answer.
-    for (const id of traceIds) this.sendingOutside.set(id, (this.sendingOutside.get(id) ?? 0) + 1);
+    for (const id of send) this.sendingOutside.set(id, (this.sendingOutside.get(id) ?? 0) + 1);
     try {
-      return await this.attempt(traceIds, initiatedBy, opts, { retry: false });
+      return await this.attempt(send, initiatedBy, opts, { retry: false });
     } finally {
-      for (const id of traceIds) {
+      for (const id of send) {
         const n = (this.sendingOutside.get(id) ?? 1) - 1;
         if (n > 0) this.sendingOutside.set(id, n);
         else this.sendingOutside.delete(id);
