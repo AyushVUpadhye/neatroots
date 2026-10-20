@@ -57,7 +57,9 @@ function importedResource(r: OtlpResource): boolean {
   return r.attributes.some((a) => a.key === "neatroots.import.source" && "stringValue" in a.value && a.value.stringValue !== "http" && a.value.stringValue !== "replay");
 }
 
-type Queued = { trace_id: string; attempts: number; next_ms: number; claimed_until: number | null };
+type Queued = { trace_id: string; attempts: number };
+/** When a queued run can next be taken, in SQL: when it is due and nobody holds it. */
+const DUE_AT = "MAX(next_ms, COALESCE(claimed_until, 0))";
 
 export class Relay {
   /** Wait before a queued run is first sent. */
@@ -96,7 +98,7 @@ export class Relay {
     if (!run || run.doctor || !run.project || !projectSettings(this.roots.config, run.project).forward) return false;
     const resources = this.roots.store.db.prepare("SELECT DISTINCT resource_id FROM spans WHERE trace_id = ?").all(traceId) as { resource_id: string }[];
     if (resources.some((r) => importedResource(this.roots.store.getResource(r.resource_id)))) return false;
-    return !this.roots.store.forwardedTraceIds().has(traceId);
+    return !this.roots.store.wasForwarded(traceId);
   }
 
   /** Sends the runs a previous neatroots queued for auto-forward but didn't get to (a restart or a crash). */
@@ -124,13 +126,9 @@ export class Relay {
     }
   }
 
-  private queued(): Queued[] {
-    return this.roots.store.db.prepare("SELECT trace_id, attempts, next_ms, claimed_until FROM auto_forwards").all() as Queued[];
-  }
-
-  /** When a queued run can next be taken: when it is due and nobody holds it. */
-  private static dueAt(r: Queued): number {
-    return Math.max(r.next_ms, r.claimed_until ?? 0);
+  /** The runs this neatroots is sending, as a JSON array for json_each, so the queue is read in SQL rather than loaded. */
+  private notSending(): string {
+    return JSON.stringify([...this.sending]);
   }
 
   private schedule(): void {
@@ -138,9 +136,12 @@ export class Relay {
     clearTimeout(this.timer);
     // At the limit, a send finishing schedules the next one; a timer now would only spin.
     if (this.sending.size >= AUTO_CONCURRENCY) return;
-    const times = this.queued().filter((r) => !this.sending.has(r.trace_id)).map(Relay.dueAt);
-    if (!times.length) return;
-    this.timer = setTimeout(() => this.drain(), Math.max(0, Math.min(...times) - Date.now()));
+    // When a queued run can next be taken: when it is due and nobody holds it.
+    const { t } = this.roots.store.db
+      .prepare(`SELECT MIN(${DUE_AT}) AS t FROM auto_forwards WHERE trace_id NOT IN (SELECT value FROM json_each(?))`)
+      .get(this.notSending()) as { t: number | null };
+    if (t === null) return;
+    this.timer = setTimeout(() => this.drain(), Math.max(0, t - Date.now()));
     this.timer.unref();
   }
 
@@ -148,9 +149,11 @@ export class Relay {
     if (this.closed) return;
     const now = Date.now();
     const claim = this.roots.store.db.prepare("UPDATE auto_forwards SET claimed_until = ? WHERE trace_id = ? AND (claimed_until IS NULL OR claimed_until <= ?)");
-    for (const r of this.queued()) {
+    const due = this.roots.store.db
+      .prepare(`SELECT trace_id, attempts FROM auto_forwards WHERE ${DUE_AT} <= ? AND trace_id NOT IN (SELECT value FROM json_each(?)) ORDER BY next_ms LIMIT ?`)
+      .all(now, this.notSending(), Math.max(0, AUTO_CONCURRENCY - this.sending.size)) as Queued[];
+    for (const r of due) {
       if (this.sending.size >= AUTO_CONCURRENCY) break;
-      if (Relay.dueAt(r) > now || this.sending.has(r.trace_id)) continue;
       // Taken in one statement, so two neatroots on the same store never both send a run.
       if (claim.run(now + AUTO_LEASE_MS, r.trace_id, now).changes !== 1) continue;
       this.sending.add(r.trace_id);

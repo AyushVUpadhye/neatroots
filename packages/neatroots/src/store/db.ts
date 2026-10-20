@@ -1268,6 +1268,11 @@ export class Store {
     }));
   }
 
+  /** Whether a run was sent to Cloud (a successful forward lists it), without reading every forward into memory. */
+  wasForwarded(traceId: string): boolean {
+    return !!this.db.prepare("SELECT 1 FROM forwards f, json_each(CASE WHEN json_valid(f.trace_ids) THEN f.trace_ids ELSE '[]' END) j WHERE f.status = 'ok' AND j.value = ? LIMIT 1").get(traceId);
+  }
+
   forwardedTraceIds(): Set<string> {
     const rows = this.db.prepare("SELECT trace_ids FROM forwards WHERE status = 'ok'").all() as { trace_ids: string }[];
     const out = new Set<string>();

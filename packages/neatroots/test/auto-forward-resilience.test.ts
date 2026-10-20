@@ -85,12 +85,12 @@ it("sends a backlog a few runs at a time after a restart, without spinning while
   tb.roots.relay.settleMs = 60_000;
   for (let i = 0; i < 40; i++) tb.roots.ingest(finishedRun(hex(16)));
   expect(queued(tb.roots.store.db)).toBe(40);
-  const reads = vi.spyOn(tb.roots.relay as unknown as { queued: () => unknown[] }, "queued");
+  const drains = vi.spyOn(tb.roots.relay as unknown as { drain: () => void }, "drain");
   tb.roots.relay.settleMs = 10;
   tb.roots.relay.resume();
   await until(() => queued(tb.roots.store.db) === 0, 20_000);
   expect(c.seen.requests).toBe(80); // every run, its spans and its marker
   expect(c.seen.maxInFlight).toBeLessThanOrEqual(4); // was 40
-  // The queue is read when a send ends, not on a timer that fires while every slot is busy.
-  expect(reads.mock.calls.length).toBeLessThan(200);
+  // The queue is drained when a send ends, not on a timer that fires while every slot is busy.
+  expect(drains.mock.calls.length).toBeLessThan(200);
 });

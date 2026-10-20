@@ -5,7 +5,6 @@ import { afterEach, expect, it } from "vitest";
 import { Roots } from "../src/core.js";
 import { defaultConfig } from "../src/config.js";
 import { decodeTraceProtobuf } from "../src/otlp/codec.js";
-import { setSecret } from "../src/relay/keychain.js";
 import { batch, freePort, hex, s, span, tmpHome, toolSpan } from "./helpers.js";
 
 // Auto-forward ("Every finished run of a project", docs/cloud.md) must survive a failed send and a
@@ -14,6 +13,7 @@ import { batch, freePort, hex, s, span, tmpHome, toolSpan } from "./helpers.js";
 
 const cleanup: (() => void | Promise<void>)[] = [];
 afterEach(async () => {
+  delete process.env.NEATLOGS_CLOUD_API_KEY;
   for (const c of cleanup.splice(0).reverse()) await c();
 });
 
@@ -89,7 +89,7 @@ function watchRejections(): unknown[] {
 }
 
 it("retries a run whose auto-forward failed with a 5xx, and sends it once", async () => {
-  await setSecret("cloud-api-key", "nl-test-key");
+  process.env.NEATLOGS_CLOUD_API_KEY = "nl-test-key";
   const c = await cloud([503, 200]);
   const roots = await open(newHome(), c.url);
   cleanup.push(() => roots.close());
@@ -100,7 +100,7 @@ it("retries a run whose auto-forward failed with a 5xx, and sends it once", asyn
 });
 
 it("doesn't retry a failure that won't pass on its own (a rejected key)", async () => {
-  await setSecret("cloud-api-key", "nl-test-key");
+  process.env.NEATLOGS_CLOUD_API_KEY = "nl-test-key";
   const c = await cloud([401]);
   const roots = await open(newHome(), c.url);
   cleanup.push(() => roots.close());
@@ -112,7 +112,7 @@ it("doesn't retry a failure that won't pass on its own (a rejected key)", async 
 });
 
 it("stops after six sends when ingest keeps failing, and drops the run from the queue", async () => {
-  await setSecret("cloud-api-key", "nl-test-key");
+  process.env.NEATLOGS_CLOUD_API_KEY = "nl-test-key";
   const c = await cloud([503]);
   const roots = await open(newHome(), c.url);
   cleanup.push(() => roots.close());
@@ -125,7 +125,7 @@ it("stops after six sends when ingest keeps failing, and drops the run from the 
 });
 
 it("keeps the attempt count and the next try in the store, doubling the wait", async () => {
-  await setSecret("cloud-api-key", "nl-test-key");
+  process.env.NEATLOGS_CLOUD_API_KEY = "nl-test-key";
   const c = await cloud([503]);
   const roots = await open(newHome(), c.url);
   cleanup.push(() => roots.close());
@@ -140,7 +140,7 @@ it("keeps the attempt count and the next try in the store, doubling the wait", a
 });
 
 it("sends a run that waits in back-off after a restart, keeping its attempt count", async () => {
-  await setSecret("cloud-api-key", "nl-test-key");
+  process.env.NEATLOGS_CLOUD_API_KEY = "nl-test-key";
   const c = await cloud([503, 200]);
   const home = newHome();
   const first = await open(home, c.url);
@@ -158,7 +158,7 @@ it("sends a run that waits in back-off after a restart, keeping its attempt coun
 });
 
 it("sends a queued run once when two neatroots share the store", async () => {
-  await setSecret("cloud-api-key", "nl-test-key");
+  process.env.NEATLOGS_CLOUD_API_KEY = "nl-test-key";
   const c = await cloud([200], 300);
   const home = newHome();
   const a = await open(home, c.url);
@@ -174,28 +174,28 @@ it("sends a queued run once when two neatroots share the store", async () => {
 });
 
 it("backs off after an unexpected error instead of retrying in a tight loop", async () => {
-  await setSecret("cloud-api-key", "nl-test-key");
+  process.env.NEATLOGS_CLOUD_API_KEY = "nl-test-key";
   const c = await cloud([200]);
   const roots = await open(newHome(), c.url);
   cleanup.push(() => roots.close());
   roots.relay.retryBaseMs = 100;
   let calls = 0;
-  const real = roots.store.forwardedTraceIds.bind(roots.store);
-  roots.store.forwardedTraceIds = () => {
+  const real = roots.store.wasForwarded.bind(roots.store);
+  roots.store.wasForwarded = (id: string) => {
     // The first look is when the run is queued; every later one is a send.
     if (++calls > 1) throw new Error("store hiccup");
-    return real();
+    return real(id);
   };
   const t = finishRun(roots);
   await new Promise((r) => setTimeout(r, 400));
   expect(calls).toBeLessThanOrEqual(4);
   expect(queue(roots)[0]?.attempts).toBeGreaterThanOrEqual(1);
-  roots.store.forwardedTraceIds = real;
+  roots.store.wasForwarded = real;
   await until(() => roots.store.forwardedTraceIds().has(t));
 });
 
 it("sends a run that a restart interrupted before it was forwarded", async () => {
-  await setSecret("cloud-api-key", "nl-test-key");
+  process.env.NEATLOGS_CLOUD_API_KEY = "nl-test-key";
   const c = await cloud([200]);
   const home = newHome();
   const first = await open(home, c.url);
@@ -213,7 +213,7 @@ it("sends a run that a restart interrupted before it was forwarded", async () =>
 });
 
 it("doesn't touch the store after neatroots closes with a forward still waiting", async () => {
-  await setSecret("cloud-api-key", "nl-test-key");
+  process.env.NEATLOGS_CLOUD_API_KEY = "nl-test-key";
   const c = await cloud([200]);
   const roots = await open(newHome(), c.url);
   roots.relay.settleMs = 100;
@@ -227,7 +227,7 @@ it("doesn't touch the store after neatroots closes with a forward still waiting"
 });
 
 it("drops a queued run when forwarding is turned off before it is sent", async () => {
-  await setSecret("cloud-api-key", "nl-test-key");
+  process.env.NEATLOGS_CLOUD_API_KEY = "nl-test-key";
   const c = await cloud([200]);
   const roots = await open(newHome(), c.url);
   cleanup.push(() => roots.close());
@@ -240,7 +240,7 @@ it("drops a queued run when forwarding is turned off before it is sent", async (
 });
 
 it("stops in back-off when neatroots closes: no send, no error, still queued for the next start", async () => {
-  await setSecret("cloud-api-key", "nl-test-key");
+  process.env.NEATLOGS_CLOUD_API_KEY = "nl-test-key";
   const c = await cloud([503]);
   const home = newHome();
   const roots = await open(home, c.url);
@@ -258,7 +258,7 @@ it("stops in back-off when neatroots closes: no send, no error, still queued for
 });
 
 it("closes cleanly with a request in flight, and leaves the run released for the next start", async () => {
-  await setSecret("cloud-api-key", "nl-test-key");
+  process.env.NEATLOGS_CLOUD_API_KEY = "nl-test-key";
   const c = await cloud([200], 400);
   const home = newHome();
   const roots = await open(home, c.url);
@@ -275,7 +275,7 @@ it("closes cleanly with a request in flight, and leaves the run released for the
 });
 
 it("doesn't send a run an import replaced under the same trace id, or a deleted run imported again", async () => {
-  await setSecret("cloud-api-key", "nl-test-key");
+  process.env.NEATLOGS_CLOUD_API_KEY = "nl-test-key";
   const c = await cloud([200]);
   const roots = await open(newHome(), c.url);
   cleanup.push(() => roots.close());
@@ -302,7 +302,7 @@ it("doesn't send a run an import replaced under the same trace id, or a deleted 
 });
 
 it("drops a run in back-off when forwarding is turned off", async () => {
-  await setSecret("cloud-api-key", "nl-test-key");
+  process.env.NEATLOGS_CLOUD_API_KEY = "nl-test-key";
   const c = await cloud([503, 200]);
   const roots = await open(newHome(), c.url);
   cleanup.push(() => roots.close());
@@ -316,7 +316,7 @@ it("drops a run in back-off when forwarding is turned off", async () => {
 });
 
 it("a retry sends the run as stored now: current endpoint, redacted", async () => {
-  await setSecret("cloud-api-key", "nl-test-key");
+  process.env.NEATLOGS_CLOUD_API_KEY = "nl-test-key";
   const failing = await cloud([503]);
   const bodies: Buffer[] = [];
   const good = await cloud([200], 0, bodies);
@@ -338,7 +338,7 @@ it("a retry sends the run as stored now: current endpoint, redacted", async () =
 });
 
 it("never auto-forwards an imported run (docs/cloud.md)", async () => {
-  await setSecret("cloud-api-key", "nl-test-key");
+  process.env.NEATLOGS_CLOUD_API_KEY = "nl-test-key";
   const c = await cloud([200]);
   const roots = await open(newHome(), c.url);
   cleanup.push(() => roots.close());
@@ -354,7 +354,7 @@ it("never auto-forwards an imported run (docs/cloud.md)", async () => {
 });
 
 it("still auto-forwards a run sent live through the HTTP trace API", async () => {
-  await setSecret("cloud-api-key", "nl-test-key");
+  process.env.NEATLOGS_CLOUD_API_KEY = "nl-test-key";
   const c = await cloud([200]);
   const roots = await open(newHome(), c.url);
   cleanup.push(() => roots.close());
@@ -366,7 +366,7 @@ it("still auto-forwards a run sent live through the HTTP trace API", async () =>
 });
 
 it("doesn't send a run again that was already sent by hand", async () => {
-  await setSecret("cloud-api-key", "nl-test-key");
+  process.env.NEATLOGS_CLOUD_API_KEY = "nl-test-key";
   const c = await cloud([200]);
   const roots = await open(newHome(), c.url);
   cleanup.push(() => roots.close());
