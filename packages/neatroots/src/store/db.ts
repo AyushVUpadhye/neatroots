@@ -473,6 +473,12 @@ export class Store {
     return json<OtlpResource>(r?.json, { attributes: [] });
   }
 
+  /** The resources a run's spans were sent with (one per sender, usually one). */
+  resourcesFor(traceId: string): OtlpResource[] {
+    const rows = this.db.prepare("SELECT DISTINCT resource_id FROM spans WHERE trace_id = ?").all(traceId) as { resource_id: string }[];
+    return rows.map((r) => this.getResource(r.resource_id));
+  }
+
   getScope(id: string): OtlpScope {
     const r = this.db.prepare("SELECT json FROM scopes WHERE id = ?").get(id) as { json: string } | undefined;
     return json<OtlpScope>(r?.json, { name: "" });

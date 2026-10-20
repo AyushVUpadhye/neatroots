@@ -184,6 +184,8 @@ export interface ImportJob {
   traces: number;
   spans: number;
   failed: number;
+  /** Runs captured here that the import kept instead of storing Cloud's copy over them. */
+  skipped: number;
   last_error: string | null;
   trace_ids: string[];
 }
