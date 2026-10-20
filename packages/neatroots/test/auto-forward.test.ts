@@ -365,6 +365,34 @@ it("still auto-forwards a run sent live through the HTTP trace API", async () =>
   await until(() => roots.store.forwardedTraceIds().has(t));
 });
 
+it("doesn't send a run while it is being sent by hand (Cloud slow to answer)", async () => {
+  process.env.NEATLOGS_CLOUD_API_KEY = "nl-test-key";
+  // Each request takes 600 ms, so the queued auto-forward comes due while the send by hand waits.
+  const c = await cloud([200], 600);
+  const roots = await open(newHome(), c.url);
+  cleanup.push(() => roots.close());
+  const t = finishRun(roots);
+  const byHand = roots.relay.forward([t], "user");
+  expect((await byHand).status).toBe("ok");
+  await until(() => queue(roots).length === 0, 5000);
+  await settled();
+  expect(c.requests()).toBe(2); // its spans and its marker, once (was 4: auto-forward sent it too)
+  expect(statuses(roots)).toEqual(["ok:200"]);
+});
+
+it("still auto-forwards a run whose send by hand failed while it waited", async () => {
+  process.env.NEATLOGS_CLOUD_API_KEY = "nl-test-key";
+  // The send by hand gets a 400 (not retried); the auto-forward that waited for it then sends the run.
+  const c = await cloud([400, 200], 400);
+  const roots = await open(newHome(), c.url);
+  cleanup.push(() => roots.close());
+  const t = finishRun(roots);
+  expect((await roots.relay.forward([t], "user")).status).toBe("error");
+  await until(() => roots.store.forwardedTraceIds().has(t), 5000);
+  expect(statuses(roots)).toEqual(["error:400", "ok:200"]);
+  expect(queue(roots)).toEqual([]);
+});
+
 it("doesn't send a run again that was already sent by hand", async () => {
   process.env.NEATLOGS_CLOUD_API_KEY = "nl-test-key";
   const c = await cloud([200]);

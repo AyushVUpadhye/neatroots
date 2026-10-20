@@ -68,6 +68,8 @@ export class Relay {
   retryBaseMs = AUTO_RETRY_MS;
   private timer?: NodeJS.Timeout;
   private sending = new Set<string>();
+  /** Runs being sent outside the queue (by hand, a confirmed push), with how many such sends are under way. */
+  private sendingOutside = new Map<string, number>();
   private closed = false;
 
   constructor(private readonly roots: Roots) {
@@ -178,6 +180,8 @@ export class Relay {
       this.roots.store.db.prepare("UPDATE auto_forwards SET attempts = ?, next_ms = ?, claimed_until = NULL WHERE trace_id = ?").run(attempts + 1, Date.now() + delay, traceId);
       log.warn(`auto-forward of ${traceId.slice(0, 8)} failed: ${why}; trying again in ${Math.round(delay / 1000)}s`);
     };
+    // Looked at again shortly, without counting a try.
+    const wait = () => void this.roots.store.db.prepare("UPDATE auto_forwards SET next_ms = ?, claimed_until = NULL WHERE trace_id = ?").run(Date.now() + this.settleMs, traceId);
     try {
       // Let checks finish so findings travel with the run.
       if (this.roots.engine) await this.roots.engine.waitIdle(traceId, 120_000);
@@ -186,6 +190,9 @@ export class Relay {
       // nothing is awaited, so an import or a settings change can't slip in between.
       const key = (await getCloudKey()) ?? "";
       if (this.closed) return;
+      // Being sent by hand right now: the run is recorded as sent only once Cloud answers, so sending
+      // it here too could send it twice. Wait for that send; if it fails, this one still goes.
+      if (this.sendingOutside.has(traceId)) return wait();
       // Deleted, replaced by an import, sent by hand meanwhile, or forwarding turned off: nothing to send.
       if (!this.eligible(traceId)) return done();
       const out = { retry: false };
@@ -323,7 +330,17 @@ export class Relay {
   }
 
   async forward(traceIds: string[], initiatedBy: string, opts: { endpoint?: string; apiKey?: string } = {}): Promise<ForwardRow> {
-    return this.attempt(traceIds, initiatedBy, opts, { retry: false });
+    // A queued auto-forward of these runs waits until this send has its answer.
+    for (const id of traceIds) this.sendingOutside.set(id, (this.sendingOutside.get(id) ?? 0) + 1);
+    try {
+      return await this.attempt(traceIds, initiatedBy, opts, { retry: false });
+    } finally {
+      for (const id of traceIds) {
+        const n = (this.sendingOutside.get(id) ?? 1) - 1;
+        if (n > 0) this.sendingOutside.set(id, n);
+        else this.sendingOutside.delete(id);
+      }
+    }
   }
 
   /**
