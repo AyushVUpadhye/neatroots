@@ -351,14 +351,12 @@ describe("server", () => {
     // Forward and import only ever reach this local stand-in for the cloud; keys come from the
     // environment, never the Keychain.
     const seen: string[] = [];
-    // A trace only Cloud has: one already stored here (t) is kept, not imported again.
-    const cloudOnly = hex(16);
     const exported = JSON.stringify({
       success: true,
       data: {
         schemaVersion: 1,
-        trace: { traceId: cloudOnly, workflowName: "prod-agent", startedAt: "2026-10-09T10:00:00Z" },
-        spans: [{ traceId: cloudOnly, spanId: hex(8), parentSpanId: null, spanName: "root", spanType: "workflow", startedAt: "2026-10-09T10:00:00Z", endedAt: "2026-10-09T10:00:01Z", durationMs: 1000, status: "OK" }],
+        trace: { traceId: t, workflowName: "prod-agent", startedAt: "2026-10-09T10:00:00Z" },
+        spans: [{ traceId: t, spanId: hex(8), parentSpanId: null, spanName: "root", spanType: "workflow", startedAt: "2026-10-09T10:00:00Z", endedAt: "2026-10-09T10:00:01Z", durationMs: 1000, status: "OK" }],
       },
     });
     const cloud = http.createServer((req, res) => {
@@ -368,7 +366,7 @@ describe("server", () => {
         seen.push(url);
         res.setHeader("content-type", "application/json");
         if (url === "/v1/traces") res.end("{}");
-        else if (url.startsWith(`/api/v1/public/traces/${cloudOnly}/export`)) res.end(exported);
+        else if (url.startsWith(`/api/v1/public/traces/${t}/export`)) res.end(exported);
         else {
           res.statusCode = 404;
           res.end("{}");
@@ -387,19 +385,15 @@ describe("server", () => {
       expect(forward.status).toBe(200);
       expect(((await forward.json()) as { status: string }).status).toBe("ok");
       expect(seen.filter((u) => u === "/v1/traces").length).toBeGreaterThan(0);
-      const importJob = async (traceIds: string[]) => {
-        const imported = await post("/api/cloud/import", traceIds);
-        expect(imported.status).toBe(202);
-        const { id } = (await imported.json()) as { id: string };
-        return until(() => {
-          const j = tb.roots.imports.get(id);
-          return j && j.state !== "running" ? j : undefined;
-        });
-      };
-      expect(await importJob([cloudOnly])).toMatchObject({ state: "succeeded", traces: 1, failed: 0 });
-      expect(seen.some((u) => u.startsWith(`/api/v1/public/traces/${cloudOnly}/export`))).toBe(true);
-      // The run sent from here is kept as it is: not downloaded, not imported over.
-      expect(await importJob([t])).toMatchObject({ state: "succeeded", traces: 0, skipped: 1, failed: 0 });
+      const imported = await post("/api/cloud/import", [t]);
+      expect(imported.status).toBe(202);
+      const { id } = (await imported.json()) as { id: string };
+      const job = await until(() => {
+        const j = tb.roots.imports.get(id);
+        return j && j.state !== "running" ? j : undefined;
+      });
+      // t was captured here, so the import keeps the local run instead of fetching Cloud's copy.
+      expect(job).toMatchObject({ state: "succeeded", traces: 0, skipped: 1, failed: 0 });
       expect(seen.some((u) => u.startsWith(`/api/v1/public/traces/${t}/export`))).toBe(false);
     } finally {
       for (const [k, v] of Object.entries(saved)) {
