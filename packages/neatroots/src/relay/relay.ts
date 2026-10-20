@@ -49,6 +49,8 @@ const AUTO_ATTEMPTS = 6;
  * doesn't send it too. Longer than one send can take: the wait for checks, the request, its marker.
  */
 const AUTO_LEASE_MS = 10 * 60_000;
+/** Most auto-forwards sent at once, so a backlog (after a restart, say) goes out a few at a time. */
+const AUTO_CONCURRENCY = 4;
 
 /** An import marks its resource with neatroots.import.source; "http" (the live /v1/trace API) and "replay" aren't imports, as in importSource(). */
 function importedResource(r: OtlpResource): boolean {
@@ -72,9 +74,15 @@ export class Relay {
     roots.store.db.exec("CREATE TABLE IF NOT EXISTS auto_forwards (trace_id TEXT PRIMARY KEY, attempts INTEGER NOT NULL DEFAULT 0, next_ms INTEGER NOT NULL, claimed_until INTEGER)");
     roots.bus.on("trace", (u) => {
       if (this.closed || (!u.rootEnded && !u.completed)) return;
-      if (!this.eligible(u.traceId)) return;
-      roots.store.db.prepare("INSERT OR IGNORE INTO auto_forwards (trace_id, attempts, next_ms) VALUES (?, 0, ?)").run(u.traceId, Date.now() + this.settleMs);
-      this.schedule();
+      // A listener that throws stops ingest after the spans are stored and keeps the checks from
+      // seeing the run, so a store that can't queue it (busy, full) only costs this auto-forward.
+      try {
+        if (!this.eligible(u.traceId)) return;
+        roots.store.db.prepare("INSERT OR IGNORE INTO auto_forwards (trace_id, attempts, next_ms) VALUES (?, 0, ?)").run(u.traceId, Date.now() + this.settleMs);
+        this.schedule();
+      } catch (err) {
+        log.warn(`couldn't queue ${u.traceId.slice(0, 8)} for auto-forward: ${(err as Error).message}`);
+      }
     });
   }
 
@@ -105,9 +113,15 @@ export class Relay {
   close(): void {
     this.closed = true;
     clearTimeout(this.timer);
-    if (!this.roots.store.db.open) return;
-    const release = this.roots.store.db.prepare("UPDATE auto_forwards SET claimed_until = NULL WHERE trace_id = ?");
-    for (const id of this.sending) release.run(id);
+    if (!this.roots.store.db.open || !this.sending.size) return;
+    // Best effort: neatroots still has to stop Laya and close the store. A claim left behind
+    // only delays that run until its lease runs out.
+    try {
+      const release = this.roots.store.db.prepare("UPDATE auto_forwards SET claimed_until = NULL WHERE trace_id = ?");
+      for (const id of this.sending) release.run(id);
+    } catch (err) {
+      log.warn(`couldn't release auto-forward claims: ${(err as Error).message}`);
+    }
   }
 
   private queued(): Queued[] {
@@ -122,6 +136,8 @@ export class Relay {
   private schedule(): void {
     if (this.closed) return;
     clearTimeout(this.timer);
+    // At the limit, a send finishing schedules the next one; a timer now would only spin.
+    if (this.sending.size >= AUTO_CONCURRENCY) return;
     const times = this.queued().filter((r) => !this.sending.has(r.trace_id)).map(Relay.dueAt);
     if (!times.length) return;
     this.timer = setTimeout(() => this.drain(), Math.max(0, Math.min(...times) - Date.now()));
@@ -133,6 +149,7 @@ export class Relay {
     const now = Date.now();
     const claim = this.roots.store.db.prepare("UPDATE auto_forwards SET claimed_until = ? WHERE trace_id = ? AND (claimed_until IS NULL OR claimed_until <= ?)");
     for (const r of this.queued()) {
+      if (this.sending.size >= AUTO_CONCURRENCY) break;
       if (Relay.dueAt(r) > now || this.sending.has(r.trace_id)) continue;
       // Taken in one statement, so two neatroots on the same store never both send a run.
       if (claim.run(now + AUTO_LEASE_MS, r.trace_id, now).changes !== 1) continue;
