@@ -341,29 +341,33 @@ export class Relay {
       await Promise.all(busy.map((id) => this.sending.get(id)));
     }
     // From here to attempt()'s marking below nothing is awaited, so no auto-forward can start in between.
-    const justSent = traceIds.filter((id) => waited.has(id) && this.roots.store.wasForwarded(id));
-    const rest = traceIds.filter((id) => !justSent.includes(id));
-    if (justSent.length && !rest.length) {
-      const sentBy = traceIds.map((id) => this.roots.store.lastForwardOf(id));
-      if (sentBy.every((r) => r)) {
-        const ids = [...new Set(sentBy.map((r) => r!.id))];
-        // One auto-forward sent them all (the usual single run): its record answers this send.
-        if (ids.length === 1) return sentBy[0]!;
-        // Several did: one record of this send, covering every run and naming those forwards.
-        return this.roots.store.insertForward({
-          trace_ids: traceIds,
-          endpoint: trimSlash(opts.endpoint ?? this.endpoint()),
-          initiated_by: initiatedBy,
-          status: "ok",
-          http_status: null,
-          span_count: 0,
-          bytes: 0,
-          redactions: 0,
-          error: `already sent by auto-forward: ${ids.join(", ")}`,
-        });
-      }
+    // A run counts as just sent only if it went to the endpoint this send is for; sent elsewhere, it goes again.
+    const target = trimSlash(opts.endpoint ?? this.endpoint());
+    const sentBy = new Map<string, ForwardRow>();
+    for (const id of traceIds) {
+      const row = waited.has(id) ? this.roots.store.lastForwardOf(id) : undefined;
+      if (row?.endpoint === target) sentBy.set(id, row);
     }
-    const send = rest.length ? rest : traceIds;
+    const rest = traceIds.filter((id) => !sentBy.has(id));
+    if (traceIds.length && !rest.length) {
+      const ids = [...new Set([...sentBy.values()].map((r) => r.id))];
+      // One auto-forward sent them all (the usual single run): its record answers this send.
+      if (ids.length === 1) return sentBy.get(traceIds[0])!;
+      // Several did: one record of this send, covering every run and naming those forwards.
+      return this.roots.store.insertForward({
+        trace_ids: traceIds,
+        endpoint: target,
+        initiated_by: initiatedBy,
+        status: "ok",
+        http_status: null,
+        span_count: 0,
+        bytes: 0,
+        redactions: 0,
+        error: `already sent by auto-forward: ${ids.join(", ")}`,
+      });
+    }
+    // The runs left to send: all of them unless an auto-forward just sent some here.
+    const send = rest;
     // A queued auto-forward of these runs waits until this send has its answer.
     for (const id of send) this.sendingOutside.set(id, (this.sendingOutside.get(id) ?? 0) + 1);
     try {

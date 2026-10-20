@@ -429,6 +429,23 @@ it("answers a send by hand of several runs, each just auto-forwarded on its own,
   expect(roots.store.listForwards().map((f) => f.id)).toContain(row.id);
 });
 
+it("still sends a run by hand to another endpoint than the one its auto-forward just used", async () => {
+  process.env.NEATLOGS_CLOUD_API_KEY = "nl-test-key";
+  const a = await cloud([200], 400);
+  const b = await cloud([200]);
+  const roots = await open(newHome(), a.url);
+  cleanup.push(() => roots.close());
+  const t = finishRun(roots);
+  const u = finishRun(roots);
+  // Both runs' auto-forwards to A are under way; then both runs are sent by hand to B.
+  await until(() => a.requests() >= 2, 5000);
+  const row = await roots.relay.forward([t, u], "user", { endpoint: b.url });
+  // B got them (was: told they were sent, with nothing reaching B).
+  expect(row).toMatchObject({ status: "ok", endpoint: b.url });
+  expect(b.requests()).toBe(2); // one request with both runs' spans, one with their markers
+  expect([...row.trace_ids].sort()).toEqual([t, u].sort());
+});
+
 it("sends a run by hand when the auto-forward it waited for failed", async () => {
   process.env.NEATLOGS_CLOUD_API_KEY = "nl-test-key";
   // The auto-forward gets a 400 (not retried); the send by hand that waited for it then goes.
